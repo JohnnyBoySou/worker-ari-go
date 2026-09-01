@@ -1,0 +1,91 @@
+# Laboratorio local do sistema de chamadas.
+#
+# Sobe Asterisk + Postgres + Redis + NATS e DUAS pontas SIPp que atendem
+# sozinhas. Com isso o fluxo inteiro roda sem operadora, sem softphone humano e
+# sem custo: originate da perna A, bridge, originate da perna B pelo `trunk`,
+# IN_PROGRESS, gravacao e finalize.
+#
+# O endpoint chamado `trunk` existe com o MESMO nome de producao, para o worker
+# montar exatamente o mesmo PJSIP/<target>@trunk. Trocar o bloco [trunk] do
+# pjsip.conf pelo do provedor e o unico passo para o tronco virar externo.
+services:
+  asterisk:
+    image: andrius/asterisk:20
+    container_name: lab-asterisk
+    # A imagem nao cria /var/spool/asterisk/recording, e e ai que a gravacao de
+    # bridge do ARI escreve: sem o diretorio, POST /bridges/<id>/record devolve
+    # 500 "No such file or directory". O cdr-csv sofre do mesmo.
+    command:
+      - /bin/sh
+      - -c
+      - |
+        mkdir -p /var/spool/asterisk/recording /var/log/asterisk/cdr-csv
+        chown -R asterisk:asterisk /var/spool/asterisk /var/log/asterisk
+        exec asterisk -f -vvv
+    volumes:
+      - ./asterisk/asterisk.conf:/etc/asterisk/asterisk.conf:ro
+      - ./asterisk/modules.conf:/etc/asterisk/modules.conf:ro
+      - ./asterisk/http.conf:/etc/asterisk/http.conf:ro
+      - ./asterisk/ari.conf:/etc/asterisk/ari.conf:ro
+      - ./asterisk/pjsip.conf:/etc/asterisk/pjsip.conf:ro
+      - ./asterisk/extensions.conf:/etc/asterisk/extensions.conf:ro
+      - ./asterisk/rtp.conf:/etc/asterisk/rtp.conf:ro
+      - asterisk-spool:/var/spool/asterisk
+    ports:
+      - "8088:8088"          # ARI (o worker roda fora do compose)
+      - "5060:5060/udp"
+      - "20000-20200:20000-20200/udp"
+    networks: [lab]
+
+  # Pontas que atendem sozinhas. -sn uas = cenario embutido "atende e segura".
+  #
+  # SEM `-i`: com `-i 0.0.0.0` o SIPp anuncia 0.0.0.0 no Contact do 200 OK e o
+  # ACK do Asterisk vai para lugar nenhum — o SIPp retransmite o 200 nove vezes e
+  # aborta por timeout. Sem a flag ele usa o IP real da interface.
+  uas-1001:
+    image: ctaloi/sipp:latest
+    container_name: lab-uas-1001
+    command: ["-sn", "uas", "-p", "5061", "-nostdin"]
+    networks: [lab]
+
+  uas-1002:
+    image: ctaloi/sipp:latest
+    container_name: lab-uas-1002
+    command: ["-sn", "uas", "-p", "5062", "-nostdin"]
+    networks: [lab]
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: lab-postgres
+    environment:
+      POSTGRES_USER: lab
+      POSTGRES_PASSWORD: lab
+      POSTGRES_DB: lab
+    volumes:
+      - ./db:/docker-entrypoint-initdb.d:ro
+    ports: ["5433:5432"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U lab"]
+      interval: 2s
+      retries: 20
+    networks: [lab]
+
+  redis:
+    image: redis:7-alpine
+    container_name: lab-redis
+    ports: ["6380:6379"]
+    networks: [lab]
+
+  nats:
+    image: nats:2.10-alpine
+    container_name: lab-nats
+    command: ["-js"]
+    ports: ["4224:4222"]
+    networks: [lab]
+
+volumes:
+  asterisk-spool:
+
+networks:
+  lab:
+    name: lab

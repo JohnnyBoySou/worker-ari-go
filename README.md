@@ -120,6 +120,47 @@ em curso** → fecha. O `terminating:wait` do lifecycle hook do ASG tem que ser
 > drenagem o faria matar o processo no meio das chamadas que a drenagem existe
 > para preservar.
 
+## Laboratório local (`lab/`)
+
+Sobe Asterisk + Postgres + Redis + NATS em Docker, com duas pontas SIPp que
+atendem sozinhas, e roda o **fluxo completo de uma chamada** — sem operadora,
+sem softphone humano e sem custo.
+
+```bash
+cd lab && docker compose up -d
+```
+
+Foi o que fechou o vão do port: o orquestrador — `StasisStart`, bridge,
+gravação, `legB`, `finalize`, duração — nunca tinha rodado contra um Asterisk de
+verdade. Resultado de uma execução real:
+
+```
+stasis            kind=outbound  ch=call_…-A
+stasis            kind=legB      ch=38460d8e-…
+legB.in_progress
+finalize          status=COMPLETED  hadRef=True
+
+banco:     COMPLETED | duration=8 | recording_name=connect-call_…
+gravação:  connect-call_….wav  (128 KB)
+depois:    ativas=0  canais=0  bridges=0   ← sem vazamento
+```
+
+Ver `lab/README.md` para as armadilhas encontradas e `lab/TRONCO-EXTERNO.md`
+para por que o tronco real exige ação do provedor (não há `type=registration`:
+o inbound é roteado para um IP fixo).
+
+## Sonda contra Asterisk real (`cmd/probe`)
+
+Valida REST + WebSocket + watchdog contra um Asterisk **de produção**, sem tocar
+em chamada nenhuma. Ela conecta num app Stasis próprio (`connect-<SHARD_ID>`) e
+o `SHARD_ID` é **obrigatório**: dois processos no mesmo app fazem o Asterisk
+dividir os eventos entre eles, e metade das chamadas ao vivo ficaria sem dono.
+
+```bash
+cp .env.example .env   # preencher ASTERISK_ARI_PASSWORD
+go run ./cmd/probe
+```
+
 ## Rodar
 
 ```bash
