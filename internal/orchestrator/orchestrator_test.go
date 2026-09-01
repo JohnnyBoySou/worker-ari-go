@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/lai/worker-ari/internal/ari"
+	"github.com/lai/worker-ari/internal/metrics"
 	"github.com/lai/worker-ari/internal/store"
 )
 
@@ -359,5 +360,19 @@ func TestInboundComDonoCriaCallEToca(t *testing.T) {
 	}
 	if len(a.ops("originate")) != 1 || a.ops("originate")[0].args[0] != "PJSIP/1002" {
 		t.Fatalf("tem que tocar o ramal do dono: %+v", a.ops("originate"))
+	}
+}
+
+func TestCarimbosDeTempoSaoUTC(t *testing.T) {
+	// As colunas de tempo da `call` sao `timestamp` SEM fuso, e o created_at vem
+	// do now() do Postgres (UTC). Se o worker gravar no fuso do host, os dois
+	// lados da MESMA linha ficam em referenciais diferentes: no laboratorio a
+	// latencia de setup (started_at - created_at) deu -3 HORAS.
+	//
+	// Em producao fica mascarado porque o container roda em UTC — mas este
+	// worker e sidecar de no EC2, e o fuso de la nao e garantido.
+	c := New(novoAri(), novoStore(), nil, nil, metrics.New(), Options{})
+	if _, off := c.now().Zone(); off != 0 {
+		t.Fatalf("carimbo com offset %ds; tem que ser UTC", off)
 	}
 }

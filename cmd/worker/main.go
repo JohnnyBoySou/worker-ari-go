@@ -89,16 +89,33 @@ func run() error {
 
 	// Eventos do Stasis. "open" dispara a cada (re)conexão -> reidrata (MERGE:
 	// chamadas já rastreadas ficam intocadas).
+	// CADA EVENTO EM SUA GOROUTINE.
+	//
+	// O handler roda dentro do laco de leitura do WebSocket: chamado direto, ele
+	// BLOQUEIA a leitura do proximo evento ate terminar. E um `onStasisStart` de
+	// saida faz ~7 idas ao ARI (answer, 2x getvar, createBridge, addChannel,
+	// originate, record) mais uma escrita no banco — em serie, isso limita o
+	// worker a ~20 eventos/s, e o originate da perna B de todas as chamadas
+	// seguintes fica na fila.
+	//
+	// Medido: a 150 simultaneas so 59 completavam; o SIPp do trunk recebia 59
+	// INVITEs em vez de 150, com a CPU do Asterisk em 33%. Nao era saturacao,
+	// era serializacao.
+	//
+	// O original em TS ja era assim: `void this.onStasisStart(ev)` e
+	// fire-and-forget, e o event loop segue para o proximo evento. A goroutine
+	// restaura essa semantica — e e exatamente para isto que o estado do
+	// orquestrador vive atras de mutex (ver internal/orchestrator/state.go).
 	a.On("StasisStart", func(_ string, p []byte) {
 		var ev ari.StasisStart
 		if json.Unmarshal(p, &ev) == nil {
-			orq.OnStasisStart(ctx, ev)
+			go orq.OnStasisStart(ctx, ev)
 		}
 	})
 	a.On("ChannelDestroyed", func(_ string, p []byte) {
 		var ev ari.ChannelDestroyed
 		if json.Unmarshal(p, &ev) == nil {
-			orq.OnChannelDestroyed(ctx, ev)
+			go orq.OnChannelDestroyed(ctx, ev)
 		}
 	})
 	a.On("open", func(string, []byte) { orq.Rehydrate(ctx) })

@@ -31,10 +31,25 @@ services:
       - ./asterisk/extensions.conf:/etc/asterisk/extensions.conf:ro
       - ./asterisk/rtp.conf:/etc/asterisk/rtp.conf:ro
       - asterisk-spool:/var/spool/asterisk
+    # LIMITE DE FILE DESCRIPTORS — o teto que primeiro aparece.
+    #
+    # Cada canal com midia consome varios fds (socket RTP + RTCP, por perna). Com
+    # o default de 1024 o Asterisk falha em "Unable to allocate RTCP socket: Too
+    # many open files" por volta de 118 canais (~59 chamadas) — e a falha NAO
+    # aparece como erro de chamada: ela simplesmente nao monta.
+    #
+    # Vale para producao: la o systemd tem LimitNOFILE=524288, mas o processo
+    # roda com SOFT limit de 1024. O teto e o mesmo.
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
     ports:
       - "8088:8088"          # ARI (o worker roda fora do compose)
       - "5060:5060/udp"
-      - "20000-20200:20000-20200/udp"
+      # RTP NAO e publicado: ele flui entre Asterisk e SIPp dentro da rede `lab`.
+      # Publicar a faixa inteira levaria minutos e nao muda nada — o worker fala
+      # ARI (8088), nunca midia.
     networks: [lab]
 
   # Pontas que atendem sozinhas. -sn uas = cenario embutido "atende e segura".
@@ -45,13 +60,15 @@ services:
   uas-1001:
     image: ctaloi/sipp:latest
     container_name: lab-uas-1001
-    command: ["-sn", "uas", "-p", "5061", "-nostdin"]
+    command: ["-sf", "/bench/uas-media.xml", "-p", "5061", "-nostdin"]
+    volumes: ["./bench:/bench:ro"]
     networks: [lab]
 
   uas-1002:
     image: ctaloi/sipp:latest
     container_name: lab-uas-1002
-    command: ["-sn", "uas", "-p", "5062", "-nostdin"]
+    command: ["-sf", "/bench/uas-media.xml", "-p", "5062", "-nostdin"]
+    volumes: ["./bench:/bench:ro"]
     networks: [lab]
 
   postgres:

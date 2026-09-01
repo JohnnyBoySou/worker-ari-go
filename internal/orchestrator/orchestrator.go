@@ -83,7 +83,19 @@ type AriClient interface {
 func New(a AriClient, st store.Store, pub *publisher.Publisher, up Uploader, m *metrics.Registry, o Options) *Orchestrator {
 	now := o.Now
 	if now == nil {
-		now = time.Now
+		// UTC SEMPRE, e nao time.Now direto.
+		//
+		// As colunas de tempo da `call` sao `timestamp` SEM fuso. O `created_at`
+		// vem do now() do Postgres, que e UTC; se o worker gravar started_at e
+		// ended_at no fuso do HOST, os dois lados da mesma linha ficam em
+		// referenciais diferentes e qualquer conta entre eles sai errada pelo
+		// offset — no laboratorio, -3h, o que faz a latencia de setup dar
+		// negativa.
+		//
+		// Em producao hoje isso fica MASCARADO porque o container roda em UTC.
+		// Mas este worker existe para ser sidecar em nos EC2, cujo fuso pode ser
+		// qualquer um, e o bug so apareceria como duracao errada no relatorio.
+		now = func() time.Time { return time.Now().UTC() }
 	}
 	newID := o.NewID
 	if newID == nil {

@@ -81,7 +81,10 @@ func (c *Orchestrator) onOutboundLeg(ctx context.Context, callID string, channel
 	if org != "" {
 		vars["ORG"] = org
 	}
-	_ = c.ari.Originate(ctx, ari.OriginateParams{
+	// O erro NAO pode ser engolido: sem a perna B a chamada fica so com o
+	// vendedor no ar e termina NO_ANSWER, sem nada no log dizendo por que. Foi
+	// assim que 91 falhas de um benchmark ficaram sem explicacao.
+	if err := c.ari.Originate(ctx, ari.OriginateParams{
 		ChannelID: leadChannelID,
 		Endpoint:  "PJSIP/" + target + "@" + c.o.TrunkEndpoint,
 		App:       c.o.AriApp,
@@ -89,7 +92,13 @@ func (c *Orchestrator) onOutboundLeg(ctx context.Context, callID string, channel
 		CallerID:  did,
 		Timeout:   c.o.RingTimeout,
 		Variables: vars,
-	})
+	}); err != nil {
+		c.m.OriginateFail()
+		logx.Error("outbound.originate_lead_falhou", "callId", callID,
+			"endpoint", "PJSIP/"+target+"@"+c.o.TrunkEndpoint, "err", err.Error())
+	} else {
+		c.m.OriginateOK()
+	}
 
 	recName := "connect-" + callID
 	c.s.setBridge(callID, bridgeRef{
