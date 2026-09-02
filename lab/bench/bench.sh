@@ -63,7 +63,7 @@ esac
 # Os pcaps sao carregados pelo SIPp no PARSE do cenario, nao na hora de tocar:
 # faltando, os containers uas ja subiram quebrados e o benchmark mediria
 # sinalizacao com silencio no lugar da midia.
-for f in media/alaw-10s.pcap media/g722-10s.pcap; do
+for f in media/alaw-300s.pcap media/g722-300s.pcap; do
   if [ ! -f "$AQUI/$f" ]; then
     echo "faltando $f. Rode: python3 $AQUI/mkpcap.py && docker compose restart uas-1001 uas-1002 uas-1003" >&2
     exit 2
@@ -77,8 +77,14 @@ agora_ms() { echo $(( $(date +%s%N) / 1000000 )); }
 dorme_ms() { [ "$1" -gt 0 ] && sleep "$(( $1 / 1000 )).$(printf '%03d' $(( $1 % 1000 )))"; return 0; }
 
 # Uma variavel de canal pelo ARI. O ARI avalia funcoes do dialplan, entao isto
-# alcanca CHANNEL(rtpqos,...) - a fonte honesta de perda e jitter, medida pelo
+# alcanca CHANNEL(rtcp,...) - a fonte honesta de perda e jitter, medida pelo
 # proprio Asterisk, e nao uma estimativa do lado de fora.
+#
+# E `rtcp`, nao `rtpqos`: CHANNEL(rtpqos,...) e de chan_sip e devolve
+# "Unable to read provided function" num canal PJSIP -- silenciosamente, porque
+# o ARI responde 200 com a mensagem de erro no corpo e o parser so via campo
+# vazio. Foi assim que a primeira rodada com medicao de midia reportou
+# "nenhuma perna respondeu" sem dizer por que.
 var_canal() {
   curl -s -m 5 -u "$ARI_AUTH" --get --data-urlencode "variable=$2" \
     "$ARI/ari/channels/$1/variable" 2>/dev/null \
@@ -226,7 +232,7 @@ ids=$(curl -s -m 15 -u "$ARI_AUTH" "$ARI/ari/channels" \
 for id in $ids; do
   nativo=$(var_canal "$id" 'CHANNEL(audionativeformat)')
   leitura=$(var_canal "$id" 'CHANNEL(audioreadformat)')
-  qos=$(var_canal "$id" 'CHANNEL(rtpqos,audio,all)')
+  qos=$(var_canal "$id" 'CHANNEL(rtcp,all)')
   # Separador TAB, nao `|`: o proprio nome do formato nativo pode trazer `|`
   # quando o canal tem varios ("(alaw|ulaw)"), e ai o parser comeria os campos.
   [ -n "$qos" ] && printf '%s\t%s\t%s\n' "${nativo:-?}" "${leitura:-?}" "$qos" >> "$TMP/midia"
@@ -240,7 +246,7 @@ else
   # `|` ("(alaw|ulaw)"); o de leitura vem cru ("alaw"). Comparar as duas strings
   # direto acusaria transcoding em 100% das pernas, sempre. A pergunta certa e
   # se o formato de LEITURA esta ENTRE os nativos: se nao esta, houve traducao.
-  awk -F'\t' '
+  awk -F'\t' -v hold="$HOLD" '
     function tem_traducao(nativos, leitura,   crus, k, n) {
       gsub(/[()]/, "", nativos)
       n = split(nativos, crus, /[|,\/]+/)
@@ -248,8 +254,16 @@ else
       return 1
     }
     { split($3, kv, ";"); for (i in kv) { split(kv[i], p, "="); v[p[1]] = p[2] }
-      lp += v["lp"]; rx += v["rxcount"]; rlp += v["rlp"]
-      j[++n] = v["rxjitter"] + 0
+      n++
+      j[n] = v["rxjitter"] + 0
+      c[n] = v["rxcount"] + 0
+      # `lp` e a perda que o Asterisk deduz de buracos na sequencia RTP, e volta
+      # como inteiro sem sinal: uma sequencia que ANDA PARA TRAS vira um numero
+      # gigante (65036 = -500 em 16 bits). Somar isso na perda produziria um
+      # percentual inventado, entao a perna implausivel e contada a parte em vez
+      # de poluir o total. Foi assim que o laco do pcap se denunciou.
+      if (v["lp"] + 0 > v["rxcount"] + 0) suspeitas++
+      else { lp += v["lp"]; rx += v["rxcount"]; rlp += v["rlp"]; medidas++ }
       if ($1 != "?" && $2 != "?") {
         conhecidas++
         par[$1 " -> " $2]++
@@ -259,9 +273,13 @@ else
     END {
       if (!n) exit
       for (a = 1; a < n; a++) for (b = a+1; b <= n; b++) if (j[b] < j[a]) { t = j[a]; j[a] = j[b]; j[b] = t }
+      for (a = 1; a < n; a++) for (b = a+1; b <= n; b++) if (c[b] < c[a]) { t = c[a]; c[a] = c[b]; c[b] = t }
       printf "  pernas na amostra: %d\n", n
-      printf "  perda RX: %d pacotes perdidos em %d recebidos (%.3f%%)   perda relatada pelo par: %d\n", \
-             lp, rx, (rx ? 100*lp/(lp+rx) : 0), rlp
+      printf "  pacotes RX por perna: p50=%d (esperado ~%d para %ds de midia a 50 pps)\n", \
+             c[int(n*0.5)+1], hold*50, hold
+      printf "  perda RX: %d perdidos em %d recebidos (%.3f%%) em %d pernas   perda relatada pelo par: %d\n", \
+             lp, rx, (rx ? 100*lp/(lp+rx) : 0), medidas, rlp
+      if (suspeitas) printf "  >> %d pernas com contador de perda implausivel (sequencia RTP andou para tras); fora do total acima\n", suspeitas
       printf "  jitter RX (s, como o Asterisk reporta): p50=%.6f p95=%.6f max=%.6f\n", \
              j[int(n*0.5)+1], j[int(n*0.95)+1], j[n]
       printf "  transcoding: %d de %d pernas com formato de leitura fora dos nativos\n", trans, conhecidas

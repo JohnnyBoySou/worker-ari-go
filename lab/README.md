@@ -79,19 +79,26 @@ As pontas SIPp não só atendem: elas **tocam RTP em laço** enquanto a chamada
 durar. Duas coisas dependem disso.
 
 **Os pcaps são gerados, não versionados.** `python3 bench/mkpcap.py` escreve
-`bench/media/alaw-10s.pcap` e `bench/media/g722-10s.pcap`. Gerar em vez de usar
-o `g711a.pcap` da imagem do SIPp resolve um problema concreto: o
+`bench/media/alaw-300s.pcap` e `bench/media/g722-300s.pcap` (3,3 MB cada). Gerar
+em vez de usar o `g711a.pcap` da imagem do SIPp resolve um problema concreto: o
 `play_pcap_audio` toca **uma vez**, e com um arquivo de duração desconhecida o
 áudio simplesmente para no meio de um teste que segura a chamada por 15s — sem
-erro e sem sintoma, medindo uma carga que não é a que se quis medir. Com duração
-conhecida (10s), o `ontimeout` do cenário rearma o play a cada 10,3s.
+erro e sem sintoma, medindo uma carga que não é a que se quis medir.
+
+**Um pcap longo, não um laço.** A alternativa era o cenário rearmar o play num
+laço, e ela foi tentada, medida e desfeita: o SIPp replica o pcap byte a byte,
+então cada volta reinicia a sequência RTP em 0 com o mesmo SSRC. O Asterisk
+passa a reportar perda absurda (`lp=65036`, que é −500 em 16 bits) e a nota de
+qualidade `txmes` cai de 88 para 20. O laço mantinha a mídia e destruía a
+medição. Com 300s tocando uma vez, os dois funcionam.
 
 O pcap de A-law tem **áudio de verdade** (uma senoide de 440 Hz codificada em
 G.711), então a gravação que sobe para o S3 é audível — o teste mais barato de
 "gravou som" contra "gravou silêncio".
 
 > **O SIPp carrega o pcap ao parsear o cenário**, não na hora de tocar. Sem os
-> arquivos, os três containers `uas-*` sobem quebrados. Gere antes do `up`.
+> arquivos, os três containers `uas-*` sobem quebrados. Gere antes do `up` — e
+> depois de regerar, `docker compose restart uas-1001 uas-1002 uas-1003`.
 
 **O modo transcoding.** Com `1001` e `1002` os dois lados falam G.711 e o
 Asterisk fica em passthrough: o cenário barato. O endpoint `1003` fala **só

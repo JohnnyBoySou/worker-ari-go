@@ -76,12 +76,28 @@ causas opostas: pool pequeno demais (culpa do script) ou disparadores presos
 esperando o back responder (achado de verdade, do sistema). A p95 da latência do
 POST contra a p50 separa os dois casos, e o veredito sai escrito.
 
-**A mídia toca em laço.** O `play_pcap_audio` roda uma vez por chamada: com o
-`g711a.pcap` da imagem, de duração desconhecida, o RTP parava no meio de um
-teste que segura a chamada por 15s — sem erro, sem sintoma, medindo uma carga
-que não era a que se quis medir. Os pcaps agora são gerados pelo `mkpcap.py`
-com duração conhecida (10s) e o `ontimeout` do cenário rearma o play a cada
-10,3s, com 300 ms de folga para o play anterior terminar.
+**A mídia dura a chamada inteira — com um pcap longo, não com um laço.** O
+`play_pcap_audio` roda uma vez: com o `g711a.pcap` da imagem, de duração
+desconhecida, o RTP parava no meio de um teste que segura a chamada por 15s —
+sem erro, sem sintoma, medindo uma carga que não era a que se quis medir.
+
+A correção óbvia era um laço no cenário (`ontimeout` rearmando o play). Ela foi
+feita, e depois **medida e desfeita**: o SIPp replica o pcap byte a byte, então
+cada volta reinicia a sequência RTP em 0 com o mesmo SSRC. Com pcap de 10s, o
+mesmo canal reporta:
+
+| momento | `lp` | `txmes` |
+|---|---:|---:|
+| 5 s (antes da 1ª volta) | 0 | 88,1 |
+| 13 s | 0 | 88,1 |
+| 24 s (2ª volta) | **65036** | **20,0** |
+
+65036 é −500 em 16 bits, e 500 é exatamente o número de pacotes do pcap. A mídia
+continuava fluindo e a estatística de perda virava lixo — o laço mantinha a
+carga e destruía a medição que existe para justificá-la. Hoje o pcap tem **300s
+e toca uma vez**: a sequência nunca volta atrás, e o relatório imprime os
+pacotes recebidos por perna contra o esperado, então mídia que pare antes do fim
+aparece em vez de passar batido.
 
 **Transcoding tem um modo.** O endpoint `1003` fala só G.722 contra a perna B em
 G.711, então `MODO=transcode ./bench.sh` põe o Asterisk para decodificar ADPCM
@@ -104,18 +120,37 @@ linhas não é um resultado.
 **Qualidade da mídia.** Latência de setup plana não diz nada sobre o que o
 cliente escuta: um nó com áudio picotado passa como sucesso desde que a
 sinalização continue rápida. Cada rodada agora amostra pernas vivas e lê
-`CHANNEL(rtpqos,audio,all)` pelo ARI — perda e jitter medidos pelo **próprio
-Asterisk**, não estimados de fora — e reporta a distribuição junto com a amostra
-crua de uma perna, para as unidades serem conferíveis.
+`CHANNEL(rtcp,all)` pelo ARI — perda e jitter medidos pelo **próprio Asterisk**,
+não estimados de fora — e reporta a distribuição junto com a amostra crua de uma
+perna, para as unidades serem conferíveis.
 
-**Se há transcoding, de fato.** O relatório afirmava passthrough por dedução dos
-codecs configurados, e isso nunca foi verificado. Agora cada rodada reporta o
-formato nativo contra o de leitura por perna e a tecnologia de cada bridge.
-Vale olhar: a **gravação de bridge acrescenta um canal à bridge**, e uma bridge
-de três partes usa `softmix`, onde tudo passa por `slin` independentemente dos
-codecs negociados. Se for o caso, "sem transcoding" nunca foi verdade nas
-rodadas com gravação ligada, e a comparação com o modo G.722 mede a diferença
-entre dois transcodings, não entre passthrough e transcoding.
+É `rtcp`, não `rtpqos`: `CHANNEL(rtpqos,...)` é de `chan_sip` e num canal PJSIP
+devolve `Unable to read provided function` — com HTTP 200 e a mensagem no corpo,
+então o parser via campo vazio e a rodada reportava "nenhuma perna respondeu"
+sem dizer por quê. O contador de perda também ganhou guarda de plausibilidade:
+`lp` volta como inteiro sem sinal, então sequência que anda para trás vira um
+número gigante, e somá-lo produziria um percentual inventado.
+
+**Se há transcoding — e há. Medido, não deduzido.** O relatório afirmava
+passthrough por dedução dos codecs configurados. Rodado contra o Asterisk do
+lab, com gravação ligada:
+
+```
+transcoding: 40 de 40 pernas com formato de leitura fora dos nativos
+  (alaw) -> slin               40 pernas
+bridges por tecnologia: 21xsoftmix
+```
+
+**Nenhuma perna estava em passthrough.** A gravação de bridge acrescenta um
+canal à bridge; bridge de três partes usa `softmix`; e no `softmix` tudo passa
+por `slin`, independentemente dos codecs negociados. "Sem transcoding" nunca foi
+verdade em nenhuma rodada com gravação ligada.
+
+Consequência para o dimensionamento: os 0,672% de CPU por chamada **já incluem**
+alaw↔slin em softmix. O `transcoding_factor=1.0` do `call-infra` não descreve
+passthrough — descreve *softmix com G.711*, que é barato (tabela de lookup) mas
+não é nada. E o modo G.722 vai medir o custo *adicional* de um codec caro sobre
+essa base, não a diferença entre passthrough e transcoding.
 
 **File descriptors contra o limite do processo.** O teto que apareceu primeiro
 agora está na tabela de cada rodada (`fds` por segundo, e o pico contra o limite

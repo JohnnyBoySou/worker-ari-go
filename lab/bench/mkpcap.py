@@ -3,11 +3,22 @@
 
 POR QUE GERAR EM VEZ DE USAR O g711a.pcap DA IMAGEM
 
-  O cenario precisa TOCAR EM LACO: o `play_pcap_audio` roda uma vez, e num
-  benchmark que segura a chamada por 15s com um pcap de duracao desconhecida o
-  RTP para no meio — a carga de midia deixa de existir sem ninguem perceber. Um
-  laco so e possivel se a duracao for CONHECIDA, para o `ontimeout` do cenario
-  rearmar o play no instante certo. Gerando o arquivo, a duracao e um parametro.
+  O `play_pcap_audio` toca UMA VEZ. Com o `g711a.pcap` da imagem, de duracao
+  desconhecida, o RTP parava no meio de um teste que segura a chamada por 15s:
+  a carga de midia deixava de existir sem ninguem perceber.
+
+  A primeira tentativa foi um LACO no cenario (`ontimeout` rearmando o play).
+  Ela mantem a midia e DESTROI a medicao: o SIPp replica o pcap como esta no
+  arquivo, entao cada volta reinicia a sequencia RTP em 0 com o mesmo SSRC.
+  Medido no lab com pcap de 10s: aos 5s e aos 13s o canal reporta `lp=0`; na
+  segunda volta vira `lp=65036` (= -500 em 16 bits, e 500 e exatamente o numero
+  de pacotes do pcap) e o `txmes` do Asterisk cai de 88 para 20. A midia continua
+  fluindo e a estatistica de perda vira lixo -- as duas coisas nao convivem.
+
+  Por isso o pcap e LONGO em vez de repetido: 300s por default cobrem qualquer
+  rodada, a sequencia RTP nunca volta atras e as estatisticas seguem validas. Se
+  a rodada passar da duracao do arquivo o RTP para, e agora isso e visivel: o
+  `rxcount` do canal denuncia.
 
   O segundo motivo e transcoding: nao existe pcap de G.722 na imagem, e sem uma
   perna que fale outro codec o Asterisk fica em passthrough e a variavel de
@@ -28,7 +39,7 @@ O QUE TEM DENTRO
 
 USO
   python3 mkpcap.py                 # gera os dois, em bench/media/
-  python3 mkpcap.py --pt 8 --seconds 10 --out media/alaw-10s.pcap
+  python3 mkpcap.py --pt 8 --seconds 60 --out media/alaw-60s.pcap
 """
 import argparse
 import math
@@ -58,31 +69,37 @@ def lin2alaw(amostra: int) -> int:
     return ((seg << 4) | ((amostra >> desloc) & 0x0F)) ^ mask
 
 
+# Um segundo de audio, depois LADRILHADO ate a duracao pedida. Nao e so
+# velocidade (300s sao 2,4 milhoes de amostras em Python puro): a 8 kHz, 440 Hz
+# fecham 440 ciclos INTEIROS em exatamente um segundo, entao a emenda nao tem
+# descontinuidade de fase e o tom sai continuo do comeco ao fim.
 def carga_alaw(quadros: int, amostras_por_quadro: int, hz: float) -> list:
     """Senoide de `hz` a 8 kHz, meia escala, codificada em A-law."""
-    saida = []
+    por_segundo = 8000 // amostras_por_quadro
+    base = []
     n = 0
-    for _ in range(quadros):
+    for _ in range(por_segundo):
         buf = bytearray(amostras_por_quadro)
         for i in range(amostras_por_quadro):
             pcm = int(16000 * math.sin(2 * math.pi * hz * n / 8000.0))
             buf[i] = lin2alaw(pcm) & 0xFF
             n += 1
-        saida.append(bytes(buf))
-    return saida
+        base.append(bytes(buf))
+    return [base[i % len(base)] for i in range(quadros)]
 
 
 def carga_sintetica(quadros: int, tamanho: int) -> list:
     """Bytes deterministicos (LCG). Ver o cabecalho: e ruido de proposito."""
-    saida = []
+    por_segundo = 8000 // tamanho
+    base = []
     estado = 0x2545F491
-    for _ in range(quadros):
+    for _ in range(por_segundo):
         buf = bytearray(tamanho)
         for i in range(tamanho):
             estado = (estado * 1103515245 + 12345) & 0xFFFFFFFF
             buf[i] = (estado >> 16) & 0xFF
-        saida.append(bytes(buf))
-    return saida
+        base.append(bytes(buf))
+    return [base[i % len(base)] for i in range(quadros)]
 
 
 # ---------------------------------------------------------------------------
@@ -149,7 +166,8 @@ def gerar(pt: int, segundos: float, ms: int, saida: str, hz: float) -> str:
 def main() -> None:
     p = argparse.ArgumentParser(description="Gera pcaps de RTP para o SIPp.")
     p.add_argument("--pt", type=int, help="payload type RTP: 8=alaw, 9=g722")
-    p.add_argument("--seconds", type=float, default=10.0)
+    p.add_argument("--seconds", type=float, default=300.0,
+                   help="duracao; o default cobre qualquer rodada do bench")
     p.add_argument("--ms", type=int, default=20, help="ms por pacote")
     p.add_argument("--hz", type=float, default=440.0, help="tom da senoide (alaw)")
     p.add_argument("--out")
@@ -161,10 +179,10 @@ def main() -> None:
         print(gerar(a.pt, a.seconds, a.ms, destino, a.hz))
         return
 
-    for pt, nome in ((8, "alaw-10s.pcap"), (9, "g722-10s.pcap")):
+    for pt, nome in ((8, "alaw-300s.pcap"), (9, "g722-300s.pcap")):
         destino = os.path.join(raiz, "media", nome)
-        gerar(pt, 10.0, 20, destino, 440.0)
-        print(f"{destino}  ({os.path.getsize(destino)} bytes, 10s, pt={pt})")
+        gerar(pt, 300.0, 20, destino, 440.0)
+        print(f"{destino}  ({os.path.getsize(destino)//1024} KB, 300s, pt={pt})")
 
 
 if __name__ == "__main__":

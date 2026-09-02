@@ -1,20 +1,25 @@
 <?xml version="1.0" encoding="ISO-8859-1" ?>
 <!DOCTYPE scenario SYSTEM "sipp.dtd">
 
-<!-- Ponta que atende E TOCA AUDIO EM LACO.
+<!-- Ponta que atende E TOCA AUDIO durante a chamada inteira.
      O cenario embutido `-sn uas` responde SIP mas nao envia RTP: um benchmark
      em cima dele mediria so sinalizacao e bridge, e a capacidade real de um no
      e limitada pela MIDIA.
 
-     O LACO nao e detalhe. O `play_pcap_audio` toca UMA VEZ; com um pcap de
-     duracao desconhecida, num teste que segura a chamada por 15s ou mais o RTP
-     simplesmente PARA no meio e a carga de midia deixa de existir - sem erro,
-     sem sintoma, e o numero que sai do benchmark passa a valer para uma carga
-     que nao e a que se quis medir. Aqui o pcap e gerado por `mkpcap.py` com
-     duracao CONHECIDA (10s), e o `ontimeout` do recv rearma o play a cada
-     10,3s: sobra folga de 300ms para o play anterior terminar, porque duas
-     execucoes simultaneas do play_pcap_audio no mesmo call se atropelariam. -->
-<scenario name="uas com midia em laco (alaw)">
+     POR QUE UM PCAP LONGO E NAO UM LACO. O `play_pcap_audio` toca uma vez, e
+     com um arquivo de duracao desconhecida o RTP parava no meio de um teste que
+     segura a chamada por 15s. A correcao obvia era um laco (`ontimeout`
+     rearmando o play), e ela FOI TENTADA E MEDIDA: mantem a midia fluindo e
+     destroi a estatistica, porque o SIPp replica o pcap byte a byte e cada
+     volta reinicia a sequencia RTP em 0 com o mesmo SSRC. Aos 5s e aos 13s o
+     canal reportava `lp=0`; na segunda volta, `lp=65036` (-500 em 16 bits, e
+     500 era o numero de pacotes do pcap) e o `txmes` do Asterisk caindo de 88
+     para 20.
+
+     Entao o pcap tem 300s e toca uma vez so: a sequencia nunca volta atras, a
+     perda e o jitter continuam medindo o que dizem medir, e 300s cobrem
+     qualquer rodada. Gere com `python3 bench/mkpcap.py`. -->
+<scenario name="uas com midia (alaw)">
 
   <recv request="INVITE" crlf="true"/>
 
@@ -56,21 +61,16 @@
 
   <recv request="ACK" rtd="true" crlf="true"/>
 
-  <!-- Inicio do laco de midia. -->
-  <label id="1"/>
-
   <!-- Toca o audio. Nao bloqueia: o play roda em outra thread e o cenario segue
        direto para o recv abaixo enquanto o RTP flui. -->
   <nop>
     <action>
-      <exec play_pcap_audio="/bench/media/alaw-10s.pcap"/>
+      <exec play_pcap_audio="/bench/media/alaw-300s.pcap"/>
     </action>
   </nop>
 
-  <!-- Segura ate o desligamento vir de quem manda: o worker, via terminate.
-       Se em 10,3s nao veio BYE, volta ao label 1 e toca de novo - e assim a
-       midia dura o quanto a chamada durar. -->
-  <recv request="BYE" timeout="10300" ontimeout="1"/>
+  <!-- Segura ate o desligamento vir de quem manda: o worker, via terminate. -->
+  <recv request="BYE" timeout="600000"/>
 
   <send>
     <![CDATA[

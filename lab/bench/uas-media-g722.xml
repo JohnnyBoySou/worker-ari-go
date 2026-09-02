@@ -10,14 +10,15 @@
      Asterisk tem de decodificar ADPCM de 16 kHz, reamostrar e recodificar:
      trabalho de DSP de verdade, por amostra, em cada sentido.
 
-     O AUDIO AQUI E RUIDO, DE PROPOSITO. O `g722-10s.pcap` tem bytes sinteticos,
+     O AUDIO AQUI E RUIDO, DE PROPOSITO. O `g722-300s.pcap` tem bytes sinteticos,
      porque nao ha codificador de G.722 no `mkpcap.py`. Isso NAO afeta a medicao
      de CPU (decodificar ADPCM custa o mesmo com lixo ou com voz) mas invalida
      qualquer leitura de QUALIDADE nesta perna: perda e jitter continuam
      validos, MOS nao. Para ouvir a gravacao, use o cenario alaw.
 
-     O laco de midia e o mesmo do `uas-media.xml`; a explicacao esta la. -->
-<scenario name="uas com midia em laco (g722, forca transcoding)">
+     Por que o pcap e longo em vez de repetido em laco: a explicacao (e a
+     medicao que motivou) estao no `uas-media.xml`. -->
+<scenario name="uas com midia (g722, forca transcoding)">
 
   <recv request="INVITE" crlf="true"/>
 
@@ -58,21 +59,16 @@
 
   <recv request="ACK" rtd="true" crlf="true"/>
 
-  <!-- Inicio do laco de midia. -->
-  <label id="1"/>
-
   <!-- Toca o audio. Nao bloqueia: o play roda em outra thread e o cenario segue
        direto para o recv abaixo enquanto o RTP flui. -->
   <nop>
     <action>
-      <exec play_pcap_audio="/bench/media/g722-10s.pcap"/>
+      <exec play_pcap_audio="/bench/media/g722-300s.pcap"/>
     </action>
   </nop>
 
-  <!-- Segura ate o desligamento vir de quem manda: o worker, via terminate.
-       Se em 10,3s nao veio BYE, volta ao label 1 e toca de novo - e assim a
-       midia dura o quanto a chamada durar. -->
-  <recv request="BYE" timeout="10300" ontimeout="1"/>
+  <!-- Segura ate o desligamento vir de quem manda: o worker, via terminate. -->
+  <recv request="BYE" timeout="600000"/>
 
   <send>
     <![CDATA[
