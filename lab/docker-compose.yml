@@ -52,7 +52,11 @@ services:
       # ARI (8088), nunca midia.
     networks: [lab]
 
-  # Pontas que atendem sozinhas. -sn uas = cenario embutido "atende e segura".
+  # Pontas que atendem sozinhas, com midia real em laco (ver bench/uas-media.xml).
+  #
+  # OS PCAPS PRECISAM EXISTIR ANTES DO `up`: o SIPp carrega o pcap ao PARSEAR o
+  # cenario, nao na hora de tocar. Subir sem eles derruba os tres containers no
+  # boot. Gere com:  python3 bench/mkpcap.py
   #
   # SEM `-i`: com `-i 0.0.0.0` o SIPp anuncia 0.0.0.0 no Contact do 200 OK e o
   # ACK do Asterisk vai para lugar nenhum — o SIPp retransmite o 200 nove vezes e
@@ -68,6 +72,17 @@ services:
     image: ctaloi/sipp:latest
     container_name: lab-uas-1002
     command: ["-sf", "/bench/uas-media.xml", "-p", "5062", "-nostdin"]
+    volumes: ["./bench:/bench:ro"]
+    networks: [lab]
+
+  # Perna A alternativa, falando SO G.722: e o que da ao benchmark um modo com
+  # TRANSCODING de verdade (`MODO=transcode ./bench/bench.sh`). Sem ela os dois
+  # lados falam G.711 e o Asterisk fica em passthrough - o cenario barato, e o
+  # unico que a primeira rodada mediu.
+  uas-1003:
+    image: ctaloi/sipp:latest
+    container_name: lab-uas-1003
+    command: ["-sf", "/bench/uas-media-g722.xml", "-p", "5063", "-nostdin"]
     volumes: ["./bench:/bench:ro"]
     networks: [lab]
 
@@ -98,6 +113,38 @@ services:
     container_name: lab-nats
     command: ["-js"]
     ports: ["4224:4222"]
+    networks: [lab]
+
+  # LocalStack: o S3 das gravacoes.
+  #
+  # Fica AQUI, na rede do lab, e nao no docker-compose do call-infra, porque o
+  # ponto e o worker gravar de verdade DURANTE o benchmark. Um S3 simulado que
+  # so responde a um smoke test isolado nao exercita o caminho que interessa: a
+  # gravacao e finalizada pelo Asterisk depois que a bridge cai, baixada pelo
+  # ARI com backoff e SO ENTAO subida. O que quebra ali quebra sob carga.
+  #
+  # Community: s3, iam, sts e ec2. `autoscaling`, `rds` e `elasticache` sao Pro
+  # e ficam de fora — o lab ja tem Postgres e Redis DE VERDADE aqui em cima, que
+  # testam mais do que o mock testaria.
+  #
+  # A porta e publicada porque o worker roda FORA do compose: ele fala
+  # AWS_ENDPOINT_URL=http://127.0.0.1:4566, do mesmo jeito que fala ARI em 8088.
+  #
+  # Quem cria o bucket e o Terraform:
+  #   cd ../../call-infra && make apply && make smoke
+  localstack:
+    image: localstack/localstack:3
+    container_name: lab-localstack
+    environment:
+      SERVICES: s3,iam,sts,ec2
+      DEBUG: "0"
+      PERSISTENCE: "0"
+    ports: ["4566:4566"]
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:4566/_localstack/health | grep -q '\"s3\": *\"available\"'"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
     networks: [lab]
 
 volumes:

@@ -1,20 +1,23 @@
 <?xml version="1.0" encoding="ISO-8859-1" ?>
 <!DOCTYPE scenario SYSTEM "sipp.dtd">
 
-<!-- Ponta que atende E TOCA AUDIO EM LACO.
-     O cenario embutido `-sn uas` responde SIP mas nao envia RTP: um benchmark
-     em cima dele mediria so sinalizacao e bridge, e a capacidade real de um no
-     e limitada pela MIDIA.
+<!-- Ponta que atende falando SO G.722, para FORCAR TRANSCODING.
 
-     O LACO nao e detalhe. O `play_pcap_audio` toca UMA VEZ; com um pcap de
-     duracao desconhecida, num teste que segura a chamada por 15s ou mais o RTP
-     simplesmente PARA no meio e a carga de midia deixa de existir - sem erro,
-     sem sintoma, e o numero que sai do benchmark passa a valer para uma carga
-     que nao e a que se quis medir. Aqui o pcap e gerado por `mkpcap.py` com
-     duracao CONHECIDA (10s), e o `ontimeout` do recv rearma o play a cada
-     10,3s: sobra folga de 300ms para o play anterior terminar, porque duas
-     execucoes simultaneas do play_pcap_audio no mesmo call se atropelariam. -->
-<scenario name="uas com midia em laco (alaw)">
+     Existe por uma lacuna do primeiro benchmark: os dois lados falavam
+     ulaw/alaw, entao o Asterisk ficava em passthrough e a variavel de maior
+     peso do plano de capacidade (transcoding derruba `calls_por_no` em ~3x)
+     nunca foi exercitada. Com esta perna em G.722 e a outra em G.711, o
+     Asterisk tem de decodificar ADPCM de 16 kHz, reamostrar e recodificar:
+     trabalho de DSP de verdade, por amostra, em cada sentido.
+
+     O AUDIO AQUI E RUIDO, DE PROPOSITO. O `g722-10s.pcap` tem bytes sinteticos,
+     porque nao ha codificador de G.722 no `mkpcap.py`. Isso NAO afeta a medicao
+     de CPU (decodificar ADPCM custa o mesmo com lixo ou com voz) mas invalida
+     qualquer leitura de QUALIDADE nesta perna: perda e jitter continuam
+     validos, MOS nao. Para ouvir a gravacao, use o cenario alaw.
+
+     O laco de midia e o mesmo do `uas-media.xml`; a explicacao esta la. -->
+<scenario name="uas com midia em laco (g722, forca transcoding)">
 
   <recv request="INVITE" crlf="true"/>
 
@@ -48,9 +51,8 @@
       s=-
       c=IN IP[media_ip_type] [media_ip]
       t=0 0
-      m=audio [media_port] RTP/AVP 8 0
-      a=rtpmap:8 PCMA/8000
-      a=rtpmap:0 PCMU/8000
+      m=audio [media_port] RTP/AVP 9
+      a=rtpmap:9 G722/8000
     ]]>
   </send>
 
@@ -63,7 +65,7 @@
        direto para o recv abaixo enquanto o RTP flui. -->
   <nop>
     <action>
-      <exec play_pcap_audio="/bench/media/alaw-10s.pcap"/>
+      <exec play_pcap_audio="/bench/media/g722-10s.pcap"/>
     </action>
   </nop>
 

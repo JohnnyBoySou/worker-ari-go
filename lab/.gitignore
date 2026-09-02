@@ -1,2 +1,5 @@
 .env
 *.log
+
+# Gerados por bench/mkpcap.py. Binarios, reproduziveis, fora do git.
+bench/media/
