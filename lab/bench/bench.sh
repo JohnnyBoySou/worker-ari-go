@@ -16,6 +16,10 @@
 #     o que o cliente ESCUTA.
 #   - TRANSCODING: se esta havendo, em quantas pernas, e em que tecnologia de
 #     bridge. Deixa de ser suposicao do relatorio e vira medida da rodada.
+#   - GRAVACOES: quantas chegaram ao bucket e quanto tempo a fila levou para
+#     drenar depois do desligamento. Sem isto o caminho de gravacao falhava
+#     inteiro (NoSuchBucket) sem aparecer em numero nenhum do relatorio: o 404 e
+#     rapido, nao suja a latencia de setup, e a rodada saia com cara de verde.
 #   - file descriptors do Asterisk contra o limite do processo. Foi o primeiro
 #     teto a aparecer (~59 chamadas com a CPU em 33%) e nao gera erro de chamada:
 #     a chamada simplesmente nao monta.
@@ -28,6 +32,7 @@
 #
 # VARIAVEIS
 #   MODO=normal|transcode   PAR=<disparadores>   AMOSTRA_MIDIA=<canais>
+#   REC=0 pula a checagem e a medicao de gravacao   REC_ESPERA=<segundos>
 set -uo pipefail
 
 AQUI="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -47,12 +52,21 @@ if [ -z "${PAR:-}" ]; then
   [ "$PAR" -gt 256 ] && PAR=256
 fi
 AMOSTRA_MIDIA=${AMOSTRA_MIDIA:-40}
+REC=${REC:-1}
+# Teto da espera pela fila de upload drenar. O semaforo e de 8 gravacoes
+# simultaneas (DefaultRecordingConcurrency) e cada uma ainda espera o Asterisk
+# finalizar o WAV com backoff, entao 600 chamadas nao drenam em segundos.
+REC_ESPERA=${REC_ESPERA:-90}
 
 BACK=${BACK:-http://127.0.0.1:8092}
 WORKER=${WORKER:-http://127.0.0.1:8091}
 ARI=${ARI:-http://127.0.0.1:8088}
 ARI_AUTH=${ARI_AUTH:-connect-ari:lab-ari-secret}
 PG="docker exec lab-postgres psql -U lab -d lab -tAc"
+# Mesmos defaults do lab/.env.lab: o que o worker usa para gravar e o que este
+# script confere. Divergir aqui seria checar um bucket e medir outro.
+export S3=${AWS_ENDPOINT_URL:-http://127.0.0.1:4566}
+export BUCKET=${AWS_S3_BUCKET_NAME:-lab-recordings}
 
 case "$MODO" in
   normal)    RAMAL_A=1001 ;;
@@ -69,6 +83,27 @@ for f in media/alaw-300s.pcap media/g722-300s.pcap; do
     exit 2
   fi
 done
+
+# O BUCKET PRECISA EXISTIR ANTES DA RODADA, pelo mesmo motivo dos pcaps: sem
+# ele a rodada mede um sistema em que a gravacao nunca subiu, e nada denuncia.
+#
+# O LocalStack do lab sobe com PERSISTENCE=0, entao o bucket morre a cada
+# `docker compose up` -- enquanto o call-infra/envs/localstack/terraform.tfstate
+# continua dizendo que ele existe. Nesse estado 100% dos uploads voltam
+# NoSuchBucket: um 404 rapido, que NAO aparece na latencia de setup, nao derruba
+# chamada nenhuma e nao entra em nenhum numero do relatorio.
+if [ "$REC" = "1" ]; then
+  cod_bucket=$(curl -s -o /dev/null -w '%{http_code}' -m 5 -I "$S3/$BUCKET" 2>/dev/null || echo 000)
+  if [ "$cod_bucket" != "200" ]; then
+    {
+      echo "bucket '$BUCKET' indisponivel em $S3 (HTTP $cod_bucket)."
+      echo "Recrie antes de medir:  cd ../../../call-infra && make apply && make smoke"
+      echo "(o tfstate pode afirmar que o bucket existe: PERSISTENCE=0 o apaga no up)"
+      echo "Para medir de proposito sem gravacao no bucket: REC=0 $0 $*"
+    } >&2
+    exit 2
+  fi
+fi
 
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
@@ -102,6 +137,8 @@ echo
 
 # Estado limpo: numeros so significam algo partindo do zero.
 $PG 'TRUNCATE "call"' >/dev/null 2>&1
+# O bucket NAO e limpo junto: `destroy`/`apply` e ciclo do call-infra, nao deste
+# script. Quem separa esta rodada das anteriores e o join por callId la embaixo.
 
 # --- disparo, com ritmo e em paralelo ---------------------------------------
 #
@@ -296,7 +333,171 @@ for id in $($PG "select id from \"call\" where status in ('RINGING','IN_PROGRESS
   curl -s -o /dev/null -m 5 -X POST "$BACK/v1/calls/$id/terminate" &
 done
 wait
-sleep 6
+REC_T0=$(agora_ms)
+# Sem REC, a espera fixa continua: o bloco de resultado le o banco e precisa do
+# finalize assentado. Com REC, quem espera e o laco de gravacoes -- e ele espera
+# MEDINDO, que e o unico jeito de ver o semaforo enquanto ele ainda esta cheio.
+[ "$REC" = "1" ] || sleep 6
+
+# --- gravacoes ---------------------------------------------------------------
+#
+# A gravacao e a UNICA parte do sistema que comeca depois que a chamada acaba, e
+# por isso ficava fora de todo numero da rodada: o Asterisk so fecha o WAV quando
+# a bridge cai, o worker baixa pelo ARI com backoff e so entao faz o PutObject,
+# com no maximo `recordings_max` em voo. Sao ~450 KB por chamada nesse funil.
+#
+# As tres fontes sao independentes e nenhuma delas e estimativa:
+#   banco     recording_url preenchida = a key PERSISTIDA (o que o player acha)
+#   bucket    Size e LastModified de cada objeto = volume e instante do PutObject
+#   /metrics  recordings_inflight contra recordings_max = saturacao do semaforo
+if [ "$REC" = "1" ]; then
+  echo
+  echo "=== gravacoes ==="
+  atendidas=$($PG 'select count(*) from "call" where started_at is not null' 2>/dev/null | tr -d ' ')
+  atendidas=${atendidas:-0}
+  REC_MAX=$(curl -s -m 3 "$WORKER/metrics" 2>/dev/null | awk '/^ari_worker_recordings_max /{print $2}')
+  REC_MAX=${REC_MAX:-0}
+
+  # O criterio de parada e o dreno ESTABILIZAR, nao um sleep fixo: sleep curto
+  # reportaria "poucas gravacoes" quando a fila so estava andando, e e assim que
+  # se inventa um gargalo que nao existe.
+  salvas=0; anterior=-1; parado=0; voltas=0
+  : > "$TMP/inflight"
+  REC_FIM=$(( REC_T0 + REC_ESPERA * 1000 ))
+  while [ "$(agora_ms)" -lt "$REC_FIM" ]; do
+    volta=$(agora_ms)
+    salvas=$($PG 'select count(*) from "call" where recording_url is not null' 2>/dev/null | tr -d ' ')
+    salvas=${salvas:-0}
+    # Amostra do semaforo NO MEIO do dreno: depois que ele esvazia, o gauge e
+    # zero e nao resta vestigio de ter saturado.
+    voo=$(curl -s -m 3 "$WORKER/metrics" 2>/dev/null \
+          | awk '/^ari_worker_recordings_inflight /{print $2}')
+    voo=${voo:-0}
+    echo "$voo" >> "$TMP/inflight"
+    voltas=$(( voltas + 1 ))
+    # Completou, mas so sai depois de 3 amostras: uma leitura isolada do
+    # semaforo nao distingue "nunca encheu" de "esvaziou antes de eu olhar".
+    [ "$salvas" -ge "$atendidas" ] && [ "$atendidas" -gt 0 ] && [ "$voltas" -ge 3 ] && break
+    # DESISTIR EXIGE AS TRES CONDICOES, e nao so "o numero parou de subir".
+    #
+    # A versao anterior parava depois de 5 voltas sem gravacao nova e reportava
+    # 0 de N: nada tinha subido AINDA porque o worker estava no backoff
+    # esperando o Asterisk fechar o WAV -- e os uploads apareciam no log do
+    # worker depois que o script ja havia impresso o relatorio. Um dreno lento
+    # saia como dreno falho.
+    #
+    #   inflight == 0   ninguem esta baixando nem subindo agora
+    #   > 20s           passou a janela em que o primeiro backoff ainda corre
+    #   parado 5x       o contador do banco confirma que estagnou
+    if [ "$salvas" = "$anterior" ] && [ "$voo" -eq 0 ] \
+       && [ $(( $(agora_ms) - REC_T0 )) -gt 20000 ]; then
+      parado=$(( parado + 1 ))
+      [ "$parado" -ge 5 ] && break
+    else
+      parado=0
+    fi
+    anterior=$salvas
+    dorme_ms $(( 1000 - ($(agora_ms) - volta) ))
+  done
+  REC_DT=$(awk -v a="$REC_T0" -v b="$(agora_ms)" 'BEGIN{printf "%.1f", (b-a)/1000}')
+
+  printf "  persistidas no banco (recording_url): %s de %s atendidas" "$salvas" "$atendidas"
+  awk -v s="$salvas" -v a="$atendidas" 'BEGIN{printf " (%.1f%%)\n", (a ? 100*s/a : 0)}'
+  echo "  dreno: ${REC_DT}s desde o terminate"
+
+  # Ocupacao do semaforo. Media e pico contra o teto, mais a fracao do tempo em
+  # que ficou CHEIO -- que e o unico dos tres que responde "o teto mordeu?".
+  awk -v teto="$REC_MAX" '
+    { n++; soma += $1; if ($1 > pico) pico = $1; if (teto > 0 && $1 >= teto) cheio++ }
+    END {
+      if (!n) { print "  semaforo: sem amostra (worker fora do ar?)"; exit }
+      printf "  semaforo de upload: media=%.1f pico=%d de %s em voo", soma/n, pico, (teto ? teto : "?")
+      printf "   saturado em %.0f%% das %d amostras\n", 100*cheio/n, n
+      if (teto > 0 && cheio > n/5)
+        printf "  >> a fila passou %.0f%% do dreno no teto: o gargalo e o semaforo, nao a rede\n", 100*cheio/n
+    }' "$TMP/inflight"
+
+  # Volume e tempo, do proprio bucket. As keys sao recordings/<org>/<callId>.wav
+  # e o TRUNCATE ja zerou o banco, entao o join por callId descarta sozinho os
+  # objetos de rodadas anteriores e o do smoke -- sem precisar limpar o bucket.
+  $PG "select id || '|' || to_char(ended_at, 'YYYY-MM-DD\"T\"HH24:MI:SS')
+       from \"call\" where ended_at is not null" 2>/dev/null \
+    | python3 -c '
+import os, re, sys, urllib.parse, urllib.request
+from datetime import datetime
+
+s3, bucket = os.environ["S3"], os.environ["BUCKET"]
+
+fim = {}
+for linha in sys.stdin:
+    linha = linha.strip()
+    if "|" in linha:
+        cid, quando = linha.split("|", 1)
+        try:
+            fim[cid] = datetime.strptime(quando, "%Y-%m-%dT%H:%M:%S")
+        except ValueError:
+            pass
+
+# ListObjectsV2 pagina em 1000 keys. Sem seguir o continuation-token, uma rodada
+# de 600 num bucket ja usado leria so o primeiro pedaco e reportaria volume a
+# menos -- silenciosamente, que e o pior jeito de errar.
+objs, token = [], None
+while True:
+    q = {"list-type": "2", "prefix": "recordings/"}
+    if token:
+        q["continuation-token"] = token
+    with urllib.request.urlopen(f"{s3}/{bucket}?" + urllib.parse.urlencode(q), timeout=20) as r:
+        xml = r.read().decode()
+    objs += re.findall(
+        r"<Key>(.*?)</Key>.*?<LastModified>(.*?)</LastModified>.*?<Size>(\d+)</Size>", xml, re.S)
+    m = re.search(r"<NextContinuationToken>(.*?)</NextContinuationToken>", xml)
+    if not m:
+        break
+    token = m.group(1)
+
+linhas = []
+for key, quando, tam in objs:
+    cid = key.rsplit("/", 1)[-1].removesuffix(".wav")
+    if cid not in fim:
+        continue
+    t = datetime.strptime(quando.split(".")[0].rstrip("Z"), "%Y-%m-%dT%H:%M:%S")
+    linhas.append((int(tam), t, (t - fim[cid]).total_seconds()))
+
+if not linhas:
+    print("  bucket: nenhum objeto desta rodada (as gravacoes nao subiram)")
+    sys.exit()
+
+def pct(v, p):
+    return sorted(v)[min(int(len(v) * p), len(v) - 1)]
+
+tams = [t for t, _, _ in linhas]
+lats = [l for _, _, l in linhas]
+inicio, ultimo = min(t for _, t, _ in linhas), max(t for _, t, _ in linhas)
+janela = (ultimo - inicio).total_seconds()
+mb = sum(tams) / 1048576
+
+print(f"  no bucket: {len(linhas)} objetos, {mb:.1f} MB no total")
+print(f"  tamanho por gravacao: p50={pct(tams,.5)/1024:.0f} KB "
+      f"p95={pct(tams,.95)/1024:.0f} KB max={max(tams)/1024:.0f} KB")
+if janela > 0:
+    print(f"  vazao de upload: {mb/janela:.1f} MB/s, {len(linhas)/janela:.1f} gravacoes/s "
+          f"(janela de {janela:.0f}s, do primeiro ao ultimo PutObject)")
+else:
+    print(f"  vazao de upload: {len(linhas)} objetos dentro do mesmo segundo")
+# LastModified do S3 tem resolucao de 1s: a latencia abaixo e grosseira por
+# construcao, e serve para a FORMA da distribuicao, nao para o valor exato.
+print(f"  fim da chamada -> objeto no bucket (+-1s): p50={pct(lats,.5):.0f}s "
+      f"p95={pct(lats,.95):.0f}s max={max(lats):.0f}s")
+' || echo "  bucket: falha ao ler a listagem"
+
+  if [ "$atendidas" -gt 0 ] && [ "$salvas" -lt "$atendidas" ]; then
+    faltam=$(( atendidas - salvas ))
+    echo "  >> $faltam chamadas atendidas sem gravacao persistida."
+    echo "     O motivo esta no log do worker: rec.unavailable (o ARI nao entregou o WAV),"
+    echo "     rec.upload_failed (o PutObject falhou) ou rec.db_save_failed (subiu e nao gravou"
+    echo "     a key -- o arquivo existe e o player nunca acha)."
+  fi
+fi
 
 # --- resultado ---------------------------------------------------------------
 echo

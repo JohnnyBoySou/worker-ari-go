@@ -159,6 +159,22 @@ a chamada não monta e não gera erro de chamada.
 
 ## O que continua em aberto
 
+- **O caminho de gravação nunca foi exercitado — em nenhuma rodada da série.**
+  100% dos uploads voltaram `NoSuchBucket`. O LocalStack do lab sobe com
+  `PERSISTENCE=0` e perde o bucket a cada `docker compose up`, enquanto o
+  `terraform.tfstate` do `call-infra` continua afirmando que ele existe — então
+  nem o `apply` era refeito. O 404 é rápido: não contaminou a latência de setup,
+  não derrubou chamada nenhuma e não apareceu em número nenhum da tabela. O que
+  ficou sem medida é justamente a carga: em produção são ~450 KB por chamada
+  (uma gravação de 20s no lab deu 530 KB) atravessando o funil de download pelo
+  ARI + `PutObject`, com no máximo 8 em voo, e todos começando *depois* do
+  desligamento. `bench.sh` agora aborta se o bucket não responder (use `REC=0`
+  para medir sem gravação de propósito) e mede o funil por três fontes
+  independentes: o banco (`recording_url` persistida), o bucket (`Size` e
+  `LastModified` de cada objeto — volume, vazão em MB/s e o atraso entre o fim
+  da chamada e o `PutObject`) e o `/metrics` do worker
+  (`recordings_inflight` contra `recordings_max`, amostrado *durante* o dreno,
+  que é a única janela em que dá para ver o semáforo cheio).
 - **A rodada com o harness corrigido não foi feita.** Toda a tabela acima vem do
   harness antigo: mídia tocando uma vez, CPS limitado pelo script, sem número de
   perda ou jitter.
