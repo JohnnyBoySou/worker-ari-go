@@ -19,6 +19,15 @@ func (c *Orchestrator) uploadRecording(ctx context.Context, callID, org, name st
 	if c.up == nil {
 		return false, nil
 	}
+	// TETO DE GRAVAÇÕES CONCORRENTES, e ele fica AQUI — no ponto único por onde
+	// passam o finalize e o backfill — para não depender de cada chamador
+	// lembrar. Ver DefaultRecordingConcurrency: o que se está racionando são as
+	// sessões HTTP do Asterisk e a RAM do sidecar, e as duas acabam juntas.
+	if !c.adquirirSlotGravacao(ctx) {
+		return false, ctx.Err()
+	}
+	defer c.liberarSlotGravacao()
+
 	bucket := c.up.BucketName()
 	key := "recordings/" + org + "/" + callID + ".wav"
 	logx.Info("rec.upload_begin", "callId", callID, "recording", name, "bucket", bucket, "key", key)

@@ -3,6 +3,8 @@ package commands
 import (
 	"context"
 	"encoding/json"
+	"fmt"
+	"strings"
 	"testing"
 )
 
@@ -64,5 +66,37 @@ func TestComandoDeOutroShardEhTermENaoExecuta(t *testing.T) {
 func TestComandoDesconhecidoEhTerm(t *testing.T) {
 	if d := Despachar(context.Background(), env("fazCafe", "call_1", "a1"), true, "a1", nil); d != Term {
 		t.Fatalf("d = %s", d)
+	}
+}
+
+// A partição por callId é o que dá concorrência SEM perder a ordem por chamada:
+// se o hash não fosse estável, dois comandos da mesma chamada poderiam cair em
+// filas diferentes e um `terminate` ultrapassaria o `startOutbound` que ele
+// existe para cancelar.
+func TestParticaoEstavelEDentroDaFaixa(t *testing.T) {
+	const n = 16
+	for _, id := range []string{"call_1", "call_abc", "call_" + strings.Repeat("z", 40), ""} {
+		p := particao(id, n)
+		if p < 0 || p >= n {
+			t.Fatalf("particao(%q) = %d, fora de [0,%d)", id, p, n)
+		}
+		for range 100 {
+			if q := particao(id, n); q != p {
+				t.Fatalf("particao(%q) instável: %d != %d", id, q, p)
+			}
+		}
+	}
+}
+
+// E tem que ESPALHAR: uma partição que engole tudo devolve o head-of-line
+// blocking que ela existe para tirar.
+func TestParticaoEspalha(t *testing.T) {
+	const n = 16
+	vistas := map[int]int{}
+	for i := range 1000 {
+		vistas[particao(fmt.Sprintf("call_%d", i), n)]++
+	}
+	if len(vistas) != n {
+		t.Fatalf("usou %d de %d partições", len(vistas), n)
 	}
 }

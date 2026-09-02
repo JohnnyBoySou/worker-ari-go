@@ -62,6 +62,20 @@ func (r *Registry) Snapshot() map[string]int64 {
 	return out
 }
 
+// Gauges são os valores INSTANTÂNEOS que o orquestrador conhece e este registro
+// não — aqui só vivem contadores monotônicos. Vão num struct, e não como uma
+// sequência de ints no Render, porque trocar dois inteiros de posição na chamada
+// é um bug silencioso: o gráfico continua desenhando, com o número errado.
+type Gauges struct {
+	ActiveCalls int
+	// RecordingsInFlight e RecordingsMax vão JUNTOS de propósito. Sozinho, o
+	// número de gravações em voo não diz nada; contra o teto, ele diz se o
+	// semáforo está saturado — que é a pergunta que se faz quando a latência de
+	// setup sobe sem a CPU subir (ver ari.DefaultSessionLimit).
+	RecordingsInFlight int
+	RecordingsMax      int
+}
+
 // ShardGauges são os gauges do modo shardeado. Omitidos, a saída é a de antes.
 type ShardGauges struct {
 	ShardID   string
@@ -79,9 +93,11 @@ type ShardGauges struct {
 // O shardId sai como info-metric rotulado, não como rótulo em toda métrica:
 // identidade de alvo é trabalho do service discovery do Prometheus, e duplicá-la
 // em cada linha só engorda a série temporal.
-func (r *Registry) Render(activeCalls int, shard *ShardGauges) string {
+func (r *Registry) Render(g Gauges, shard *ShardGauges) string {
 	var b strings.Builder
-	fmt.Fprintf(&b, "ari_worker_active_calls %d\n", activeCalls)
+	fmt.Fprintf(&b, "ari_worker_active_calls %d\n", g.ActiveCalls)
+	fmt.Fprintf(&b, "ari_worker_recordings_inflight %d\n", g.RecordingsInFlight)
+	fmt.Fprintf(&b, "ari_worker_recordings_max %d\n", g.RecordingsMax)
 	snap := r.Snapshot()
 	chaves := make([]string, 0, len(snap))
 	for k := range snap {

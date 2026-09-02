@@ -12,6 +12,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
@@ -42,10 +43,13 @@ type Options struct {
 	VoiceTalkToken            string
 	BackURL                   string
 	WorkerAPIKey              string
-	HTTPClient                *http.Client
-	Now                       func() time.Time
-	NewID                     func() string
-	Sleep                     func(context.Context, time.Duration)
+	// RecordingConcurrency é o teto de gravações sendo baixadas/enviadas ao mesmo
+	// tempo. <= 0 usa DefaultRecordingConcurrency. Ver uploadRecording.
+	RecordingConcurrency int
+	HTTPClient           *http.Client
+	Now                  func() time.Time
+	NewID                func() string
+	Sleep                func(context.Context, time.Duration)
 }
 
 type Orchestrator struct {
@@ -58,7 +62,25 @@ type Orchestrator struct {
 	s    *state
 	now  func() time.Time
 	newI func() string
+	// recSem é o teto de gravações concorrentes; recEmVoo é o mesmo número
+	// exposto no /metrics. Ver uploadRecording.
+	recSem   chan struct{}
+	recEmVoo atomic.Int64
 }
+
+// DefaultRecordingConcurrency: oito gravações ao mesmo tempo.
+//
+// O número sai do orçamento de sessões HTTP do Asterisk (ver
+// ari.DefaultSessionLimit): das ~92 conexões que o cliente REST pode abrir, no
+// máximo estas oito ficam presas em download de gravação — arquivo de MBs, que
+// segura a sessão por segundos. As outras ~84 continuam livres para o controle
+// de chamadas, que é o que não pode esperar.
+//
+// Oito também é o teto de RAM: o WAV é carregado inteiro em memória antes de ir
+// para o S3, e sem limite uma drenagem com 600 chamadas ativas carregaria 600
+// arquivos de uma vez — em um sidecar cuja razão de existir é RSS de 30-50 MB,
+// ao lado de um Asterisk sensível a jitter.
+const DefaultRecordingConcurrency = 8
 
 // AriClient é o subconjunto do client que o orquestrador usa. Interface para os
 // testes exercitarem o fluxo sem Asterisk.
@@ -104,6 +126,9 @@ func New(a AriClient, st store.Store, pub *publisher.Publisher, up Uploader, m *
 	if o.HTTPClient == nil {
 		o.HTTPClient = &http.Client{Timeout: 10 * time.Second}
 	}
+	if o.RecordingConcurrency <= 0 {
+		o.RecordingConcurrency = DefaultRecordingConcurrency
+	}
 	if o.Sleep == nil {
 		o.Sleep = func(ctx context.Context, d time.Duration) {
 			t := time.NewTimer(d)
@@ -114,7 +139,33 @@ func New(a AriClient, st store.Store, pub *publisher.Publisher, up Uploader, m *
 			}
 		}
 	}
-	return &Orchestrator{ari: a, st: st, pub: pub, up: up, m: m, o: o, s: newState(), now: now, newI: newID}
+	return &Orchestrator{
+		ari: a, st: st, pub: pub, up: up, m: m, o: o, s: newState(), now: now, newI: newID,
+		recSem: make(chan struct{}, o.RecordingConcurrency),
+	}
+}
+
+// RecordingsInFlight e RecordingsMax alimentam o /metrics. Em voo contra o teto
+// é o que mostra saturação — o número sozinho não diz nada.
+func (c *Orchestrator) RecordingsInFlight() int { return int(c.recEmVoo.Load()) }
+func (c *Orchestrator) RecordingsMax() int      { return cap(c.recSem) }
+
+// adquirirSlotGravacao espera uma vaga. Devolve false só se o contexto morrer
+// antes — e o do finalize é WithoutCancel de propósito, porque uma gravação que
+// espera é melhor que uma gravação que se perde.
+func (c *Orchestrator) adquirirSlotGravacao(ctx context.Context) bool {
+	select {
+	case c.recSem <- struct{}{}:
+		c.recEmVoo.Add(1)
+		return true
+	case <-ctx.Done():
+		return false
+	}
+}
+
+func (c *Orchestrator) liberarSlotGravacao() {
+	c.recEmVoo.Add(-1)
+	<-c.recSem
 }
 
 // ActiveCalls é o gauge de chamadas ativas. `callOrg` é povoado no início do
@@ -219,6 +270,9 @@ func (c *Orchestrator) StartOutbound(ctx context.Context, cmd StartOutbound, ult
 		return nil
 	}
 	c.s.setOrg(callID, cmd.OrganizationID)
+	// Guarda o que o handler do Stasis vai precisar quando a perna A atender —
+	// ver state.outboundDe.
+	c.s.setOutbound(callID, cmd.TrunkTarget, cmd.CallerDid)
 
 	err := c.ari.Originate(ctx, ari.OriginateParams{
 		ChannelID: sellerChannelID,

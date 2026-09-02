@@ -10,6 +10,9 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/lai/worker-ari/internal/ari"
+	"github.com/lai/worker-ari/internal/commands"
+	"github.com/lai/worker-ari/internal/orchestrator"
 	"github.com/lai/worker-ari/internal/shard"
 )
 
@@ -33,6 +36,16 @@ type Config struct {
 
 	CommandSubjectBase string
 	EventsChannel      string
+	// CmdParticoes é a concorrência do consumo de comandos, particionada por
+	// callId (ver internal/commands.Connect).
+	CmdParticoes int
+	// AriMaxConns é o TETO de conexões simultâneas com o ARI deste nó, derivado
+	// do sessionlimit do Asterisk menos a reserva.
+	AriMaxConns int
+	// RecordingConcurrency é quantas dessas conexões podem estar em gravação.
+	RecordingConcurrency int
+	// PGMaxConns é o teto do pool do Postgres. <= 0 deixa o default do pgx.
+	PGMaxConns int
 
 	ShardRegistryKey string
 	ShardHeartbeat   time.Duration
@@ -95,6 +108,17 @@ func Load() (Config, error) {
 	}
 	base := env("ASTERISK_ARI_APP", "connect")
 
+	// ORÇAMENTO DE SESSÕES HTTP DO ASTERISK. O `sessionlimit` do http.conf do nó
+	// é um teto DURO e compartilhado: passando dele o Asterisk recusa a conexão,
+	// e um originate recusado é uma chamada que não monta. Este valor tem que
+	// bater com o que o worker-asterisk renderiza — se lá for menor, o teto que
+	// vale é o de lá. Ver ari.DefaultSessionLimit.
+	sessionLimit := num("ARI_HTTP_SESSION_LIMIT", ari.DefaultSessionLimit)
+	ariMaxConns := sessionLimit - ari.ReservaSessoes
+	if ariMaxConns <= 0 {
+		ariMaxConns = ari.DefaultMaxConns
+	}
+
 	c := Config{
 		// Como sidecar, o bind é 127.0.0.1:8088 do PRÓPRIO nó — o worker não fala
 		// com o ARI de outro shard.
@@ -124,6 +148,20 @@ func Load() (Config, error) {
 
 		CommandSubjectBase: env("ARI_COMMAND_SUBJECT", "ari.cmd"),
 		EventsChannel:      env("ARI_EVENTS_CHANNEL", "ari.call-events"),
+
+		// 16 partições contra 6-11 comandos/s por shard é folga deliberada: o que
+		// se compra aqui não é vazão, é impedir que um comando lento segure os
+		// outros (ver internal/commands.Connect).
+		CmdParticoes: num("ARI_CMD_PARTITIONS", commands.DefaultParticoes),
+		AriMaxConns:  num("ARI_MAX_CONNS", ariMaxConns),
+		// Das conexões acima, quantas podem estar presas em gravação — arquivo de
+		// MBs, que segura a sessão por segundos. O resto fica para o controle de
+		// chamadas, que é o que não pode esperar.
+		RecordingConcurrency: num("RECORDING_CONCURRENCY", orchestrator.DefaultRecordingConcurrency),
+		// O pool do pgx tem default max(4, NumCPU) — num sidecar de 2 vCPUs, 4
+		// conexões para as ~4 escritas de cada chamada. Com goroutine por evento,
+		// um pico de finalizações vira fila no pool antes de virar fila no banco.
+		PGMaxConns: num("PG_MAX_CONNS", 20),
 
 		ShardRegistryKey: env("ARI_SHARD_REGISTRY_KEY", "ari:shards"),
 		ShardHeartbeat:   ms("ARI_SHARD_HEARTBEAT_MS", 5*time.Second),

@@ -57,8 +57,16 @@ func (c *Orchestrator) OnStasisStart(ctx context.Context, ev ari.StasisStart) {
 func (c *Orchestrator) onOutboundLeg(ctx context.Context, callID string, channel ari.Channel) {
 	_ = c.ari.Answer(ctx, channel.ID)
 
-	target := c.ari.GetChannelVar(ctx, channel.ID, "OUTBOUND_TARGET")
-	did := c.ari.GetChannelVar(ctx, channel.ID, "OUTBOUND_DID")
+	// Destino e DID vieram do próprio comando startOutbound e estão em memória:
+	// lê-los de volta pelo ARI são DOIS round-trips REST no caminho crítico de
+	// cada chamada, para receber de volta o que este mesmo processo mandou. A
+	// variável de canal continua sendo a fonte quando o mapa não tem — o worker
+	// reiniciou entre o originate e o atendimento, e aí quem lembra é o Asterisk.
+	target, did, emMemoria := c.s.outboundDe(callID)
+	if !emMemoria {
+		target = c.ari.GetChannelVar(ctx, channel.ID, "OUTBOUND_TARGET")
+		did = c.ari.GetChannelVar(ctx, channel.ID, "OUTBOUND_DID")
+	}
 
 	if target == "" {
 		_ = c.ari.Hangup(ctx, channel.ID)
@@ -290,24 +298,21 @@ func (c *Orchestrator) OnChannelDestroyed(ctx context.Context, ev ari.ChannelDes
 		return
 	}
 
-	// Perna A que caiu ANTES do bridge (vendedor não atendeu).
-	callID, err := c.st.FindCallIDByChannel(ctx, channelID)
-	if err != nil || callID == "" {
+	// Perna A que caiu ANTES do bridge (vendedor não atendeu). Uma consulta só
+	// traz o callId E o status: ver store.ChannelCall.
+	achada, err := c.st.FindCallByChannel(ctx, channelID)
+	if err != nil || achada == nil || achada.CallID == "" {
 		return
 	}
+	callID := achada.CallID
 	// Só marca NO_ANSWER se a chamada AINDA estava tocando. Se já finalizou ou
 	// estava em conversa, este evento é só o eco da perna sobrevivente que NÓS
 	// derrubamos no encerramento — não pode sobrescrever o status final.
-	timing, _ := c.st.GetCallTiming(ctx, callID)
 	outcome := hangupcause.Classify(ev.Cause)
-	statusAtual := "?"
-	if timing != nil {
-		statusAtual = timing.Status
-	}
 	logx.Info("destroyed.fallback", "ch", channelID, "callId", callID,
-		"statusAtual", statusAtual, "cause", ev.Cause, "failureReason", outcome.FailureReason)
+		"statusAtual", achada.Status, "cause", ev.Cause, "failureReason", outcome.FailureReason)
 
-	if timing != nil && timing.Status == "RINGING" {
+	if achada.Status == "RINGING" {
 		p := store.Patch{Status: store.S(outcome.Status), EndedAt: store.T(c.now())}
 		if outcome.FailureReason != "" {
 			p.FailureReason = store.S(outcome.FailureReason)
@@ -327,7 +332,7 @@ func (c *Orchestrator) OnChannelDestroyed(ctx context.Context, ev ari.ChannelDes
 	// IN_PROGRESS aqui é o eco de uma perna que o próprio finalize derrubou.
 	// Nesse caso o finalize ainda precisa da org para publicar o status e subir a
 	// gravação; apagar agora abre uma corrida e produz rec.skip/org_unknown.
-	if timing == nil || timing.Status != "IN_PROGRESS" {
+	if achada.Status != "IN_PROGRESS" {
 		c.s.deleteOrg(callID)
 	}
 }

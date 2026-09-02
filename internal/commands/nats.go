@@ -12,6 +12,8 @@ package commands
 import (
 	"context"
 	"encoding/json"
+	"hash/fnv"
+	"sync"
 	"time"
 
 	"github.com/lai/worker-ari/internal/logx"
@@ -112,15 +114,60 @@ func Despachar(ctx context.Context, env Envelope, ok bool, shardID string, o *or
 	return Ack
 }
 
+// DefaultParticoes é a concorrência do consumo. Ver Connect.
+const DefaultParticoes = 16
+
+// capFila é o buffer de cada partição. Pequeno de propósito: com o AckWait de
+// 30s, mensagem parada em fila longa seria REENTREGUE pelo JetStream enquanto
+// ainda espera a vez. Encher a fila bloqueia o handler — que é a contrapressão
+// correta, e só acontece se uma partição estiver de fato saturada.
+const capFila = 32
+
 type Consumer struct {
 	nc      *nats.Conn
 	cc      jetstream.ConsumeContext
 	shardID string
 	orq     *orchestrator.Orchestrator
 	nak     time.Duration
+	filas   []chan jetstream.Msg
+	wg      sync.WaitGroup
+	fechar  sync.Once
 }
 
-func Connect(ctx context.Context, url, shardID string, orq *orchestrator.Orchestrator, nak time.Duration) (*Consumer, error) {
+// particao escolhe a fila pelo callId. Hash estável (FNV-1a): a MESMA chamada
+// cai sempre na mesma fila, entre restarts inclusive.
+func particao(callID string, n int) int {
+	h := fnv.New32a()
+	_, _ = h.Write([]byte(callID))
+	return int(h.Sum32() % uint32(n))
+}
+
+// Connect abre a conexão, garante o stream e começa a consumir.
+//
+// CONCORRÊNCIA PARTICIONADA POR callId — e por que não é um pool solto.
+//
+// O handler de `jetstream.Consume` é chamado SEQUENCIALMENTE pela biblioteca: a
+// mensagem seguinte só é entregue depois que a anterior retorna, e a reposição
+// do pull acontece na mesma volta do laço. Como despachar um comando faz I/O
+// (originate por REST no Asterisk + UPDATE no Postgres), UM comando lento segura
+// a fila INTEIRA do shard — com o timeout de 15s do cliente ARI, um originate
+// travado atrasa em 15s todos os comandos atrás dele, inclusive os `terminate`,
+// que são justamente os que não podem esperar. A vazão média não é o problema
+// (6 a 11 comandos/s por shard); a cauda é.
+//
+// Despachar cada mensagem numa goroutine solta resolveria o bloqueio e quebraria
+// a ORDEM: um `terminate` publicado logo depois do `startOutbound` da mesma
+// chamada poderia executar antes dele, e a chamada ficaria discando sem ninguém
+// para desligá-la — o pior desfecho possível, porque o cliente vê o botão de
+// desligar sem efeito.
+//
+// Por isso a concorrência é por PARTIÇÃO: o callId escolhe a fila, e dentro de
+// uma fila tudo continua serial. Comandos da MESMA chamada preservam a ordem;
+// chamadas diferentes deixam de esperar umas pelas outras.
+func Connect(ctx context.Context, url, shardID string, orq *orchestrator.Orchestrator, nak time.Duration, particoes int) (*Consumer, error) {
+	if particoes <= 0 {
+		particoes = DefaultParticoes
+	}
 	nc, err := nats.Connect(url, nats.MaxReconnects(-1), nats.ReconnectWait(time.Second))
 	if err != nil {
 		return nil, err
@@ -159,34 +206,76 @@ func Connect(ctx context.Context, url, shardID string, orq *orchestrator.Orchest
 	}
 
 	c := &Consumer{nc: nc, shardID: shardID, orq: orq, nak: nak}
+	c.filas = make([]chan jetstream.Msg, particoes)
+	for i := range c.filas {
+		c.filas[i] = make(chan jetstream.Msg, capFila)
+		c.wg.Add(1)
+		go func(fila <-chan jetstream.Msg) {
+			defer c.wg.Done()
+			for m := range fila {
+				c.processar(ctx, m)
+			}
+		}(c.filas[i])
+	}
+
 	c.cc, err = cons.Consume(func(m jetstream.Msg) {
 		env, ok := Parse(m.Data())
-		switch Despachar(ctx, env, ok, shardID, orq) {
-		case Ack:
-			_ = m.Ack()
-		case Nak:
-			_ = m.NakWithDelay(c.nak)
-		default:
-			_ = m.Term()
+		// Envelope ilegível não tem callId para particionar — e a disposição é
+		// Term de qualquer jeito, sem I/O. Resolve aqui mesmo.
+		if !ok {
+			c.responder(m, Despachar(ctx, env, ok, shardID, orq))
+			return
 		}
+		c.filas[particao(env.CallID, len(c.filas))] <- m
 	})
 	if err != nil {
+		c.fecharFilas()
+		c.wg.Wait()
 		nc.Close()
 		return nil, err
 	}
-	logx.Info("nats.consumindo", "stream", Stream, "subject", Subject(shardID), "durable", Durable(shardID))
+	logx.Info("nats.consumindo", "stream", Stream, "subject", Subject(shardID),
+		"durable", Durable(shardID), "particoes", particoes)
 	return c, nil
 }
 
+func (c *Consumer) processar(ctx context.Context, m jetstream.Msg) {
+	env, ok := Parse(m.Data())
+	c.responder(m, Despachar(ctx, env, ok, c.shardID, c.orq))
+}
+
+func (c *Consumer) responder(m jetstream.Msg, d Disposicao) {
+	switch d {
+	case Ack:
+		_ = m.Ack()
+	case Nak:
+		_ = m.NakWithDelay(c.nak)
+	default:
+		_ = m.Term()
+	}
+}
+
 // Pause para de puxar comando novo sem fechar a conexão — passo 2 da drenagem.
+// O que já está nas filas SEGUE sendo processado: são comandos aceitos, e a
+// drenagem existe para terminar o que foi aceito, não para descartá-lo.
 func (c *Consumer) Pause() {
 	if c.cc != nil {
 		c.cc.Stop()
 	}
 }
 
+func (c *Consumer) fecharFilas() {
+	c.fechar.Do(func() {
+		for _, f := range c.filas {
+			close(f)
+		}
+	})
+}
+
 func (c *Consumer) Close() {
 	c.Pause()
+	c.fecharFilas()
+	c.wg.Wait()
 	if c.nc != nil {
 		_ = c.nc.Drain()
 	}

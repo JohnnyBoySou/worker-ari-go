@@ -163,20 +163,56 @@ func TestFluxoOutboundAteInProgress(t *testing.T) {
 }
 
 func TestSemTargetFalhaEDesliga(t *testing.T) {
-	// Sem OUTBOUND_TARGET não há para quem discar. Deixar a perna A no ar seria
-	// um canal órfão vivo no Stasis com o vendedor ouvindo silêncio.
+	// Sem destino não há para quem discar. Deixar a perna A no ar seria um canal
+	// órfão vivo no Stasis com o vendedor ouvindo silêncio.
+	//
+	// Dois caminhos chegam aqui, e os dois têm que desligar: o comando veio sem
+	// trunkTarget, e o worker reiniciou entre o originate e o atendimento (o
+	// destino em memória se perdeu e a variável de canal também não responde).
+	casos := map[string]func(c *Orchestrator){
+		"comando sem trunkTarget": func(c *Orchestrator) {
+			cmd := cmdOut("call_1")
+			cmd.TrunkTarget = ""
+			_ = c.StartOutbound(ctx, cmd, false)
+		},
+		"apos restart, sem variavel de canal": func(*Orchestrator) {},
+	}
+	for nome, preparar := range casos {
+		t.Run(nome, func(t *testing.T) {
+			a, s := novoAri(), novoStore()
+			c := orq(a, s, Options{})
+			preparar(c)
+			c.OnStasisStart(ctx, ari.StasisStart{Args: []string{"outbound", "call_1"},
+				Channel: ari.Channel{ID: "call_1-A"}})
+
+			if len(a.ops("hangup")) != 1 {
+				t.Fatal("tem que desligar a perna A")
+			}
+			p, _ := s.ultimoPatch()
+			if p.FailureReason == nil || *p.FailureReason != "no_target" {
+				t.Fatalf("patch = %+v", p)
+			}
+		})
+	}
+}
+
+// O destino do outbound vem do COMANDO, não de uma ida ao ARI: é o que poupa
+// dois round-trips REST no caminho crítico de cada chamada (ver
+// state.outboundDe). Sem variável de canal nenhuma no Asterisk, o originate do
+// lead tem que sair com o destino certo assim mesmo.
+func TestOutboundNaoLeVariaveisDeVoltaDoAri(t *testing.T) {
 	a, s := novoAri(), novoStore()
-	c := orq(a, s, Options{})
+	c := orq(a, s, Options{TrunkEndpoint: "trunk"})
 	_ = c.StartOutbound(ctx, cmdOut("call_1"), false)
 	c.OnStasisStart(ctx, ari.StasisStart{Args: []string{"outbound", "call_1"},
 		Channel: ari.Channel{ID: "call_1-A"}})
 
-	if len(a.ops("hangup")) != 1 {
-		t.Fatal("tem que desligar a perna A")
+	ops := a.ops("originate")
+	if len(ops) != 2 || !strings.HasPrefix(ops[1].args[0], "PJSIP/1842554188887777@trunk") {
+		t.Fatalf("originate do lead errado: %+v", ops)
 	}
-	p, _ := s.ultimoPatch()
-	if p.FailureReason == nil || *p.FailureReason != "no_target" {
-		t.Fatalf("patch = %+v", p)
+	if n := len(a.ops("getvar")); n != 0 {
+		t.Fatalf("não devia ler variável de canal, leu %d", n)
 	}
 }
 

@@ -53,7 +53,7 @@ func run() error {
 	boot, cancelBoot := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancelBoot()
 
-	pg, err := store.NewPostgres(boot, cfg.DatabaseURL)
+	pg, err := store.NewPostgres(boot, cfg.DatabaseURL, cfg.PGMaxConns)
 	if err != nil {
 		return err
 	}
@@ -77,14 +77,21 @@ func run() error {
 	m := metrics.New()
 	a := ari.New(ari.Options{
 		BaseURL: cfg.AriURL, Username: cfg.AriUser, Password: cfg.AriPassword,
-		App: cfg.AriApp, AppCheck: cfg.AppCheck,
+		App: cfg.AriApp, AppCheck: cfg.AppCheck, MaxConns: cfg.AriMaxConns,
 	})
+	// O cliente do orquestrador fala com o back e com o voice-talk — dois hosts,
+	// e o notifyBackFinalized dispara uma requisição por chamada ENCERRADA. Com o
+	// transporte padrão (2 conexões ociosas por host), um pico de encerramentos
+	// vira handshake TCP por chamada; ver ari.NewTransport.
+	httpOut := &http.Client{Timeout: 10 * time.Second, Transport: ari.NewTransport(cfg.AriMaxConns)}
 	orq := orchestrator.New(a, pg, publisher.New(rdb, cfg.EventsChannel), up, m, orchestrator.Options{
 		AriApp: cfg.AriApp, TrunkEndpoint: cfg.TrunkEndpoint, RingTimeout: cfg.RingTimeout,
 		MaxCalls: cfg.MaxCalls, RecordingDownloadAttempts: cfg.RecordingDownloadAttempts,
 		AIAudiosocketAddr:   cfg.AIAudiosocketAddr,
 		VoiceTalkControlURL: cfg.VoiceTalkControlURL, VoiceTalkToken: cfg.VoiceTalkToken,
 		BackURL: cfg.BackURL, WorkerAPIKey: cfg.WorkerAPIKey,
+		RecordingConcurrency: cfg.RecordingConcurrency,
+		HTTPClient:           httpOut,
 	})
 
 	// Eventos do Stasis. "open" dispara a cada (re)conexão -> reidrata (MERGE:
@@ -135,7 +142,7 @@ func run() error {
 	})
 	reg.Start(ctx)
 
-	cons, err := commands.Connect(ctx, cfg.NatsURL, cfg.ShardID, orq, 5*time.Second)
+	cons, err := commands.Connect(ctx, cfg.NatsURL, cfg.ShardID, orq, 5*time.Second, cfg.CmdParticoes)
 	if err != nil {
 		return err
 	}
@@ -146,7 +153,11 @@ func run() error {
 			AppAliveAt: a.AppAliveAt,
 			AppCheck:   func() time.Duration { return cfg.AppCheck },
 			RenderMetrics: func() string {
-				return m.Render(orq.ActiveCalls(), &metrics.ShardGauges{
+				return m.Render(metrics.Gauges{
+					ActiveCalls:        orq.ActiveCalls(),
+					RecordingsInFlight: orq.RecordingsInFlight(),
+					RecordingsMax:      orq.RecordingsMax(),
+				}, &metrics.ShardGauges{
 					ShardID: cfg.ShardID, MaxCalls: cfg.MaxCalls,
 					Accepting: aceitando(), Draining: draining.Load(),
 				})
@@ -170,9 +181,13 @@ func run() error {
 	// (que o usa também como contexto do dialplan). Logar os nomes derivados no
 	// boot permite conferir com um grep, em vez de descobrir pelo sintoma —
 	// "comando aceito, chamada nunca montada".
+	// O orçamento de sessões no boot permite conferir com um grep que o worker e
+	// o `sessionlimit` do Asterisk deste nó estão falando do mesmo número — em
+	// vez de descobrir pelo sintoma, que é chamada que não monta sem erro.
 	logx.Info("worker.boot",
 		"shardId", cfg.ShardID, "ariApp", cfg.AriApp, "subject", cfg.CommandSubject(),
-		"ari", cfg.AriURL, "maxCalls", cfg.MaxCalls, "port", cfg.MetricsPort)
+		"ari", cfg.AriURL, "maxCalls", cfg.MaxCalls, "port", cfg.MetricsPort,
+		"ariMaxConns", cfg.AriMaxConns, "recordingConcurrency", cfg.RecordingConcurrency)
 
 	<-ctx.Done()
 

@@ -54,7 +54,7 @@ func TestSnapshotECopia(t *testing.T) {
 
 func TestRenderSemShardEOFormatoAntigo(t *testing.T) {
 	// Compatibilidade: sem shard, a saída é a do modo single-node.
-	out := New().Render(4, nil)
+	out := New().Render(Gauges{ActiveCalls: 4}, nil)
 	if !strings.Contains(out, "ari_worker_active_calls 4") {
 		t.Fatal("gauge de ativas ausente")
 	}
@@ -74,7 +74,7 @@ func TestRenderSemShardEOFormatoAntigo(t *testing.T) {
 func TestRenderComShardDistingueSaturacaoDeDrenagem(t *testing.T) {
 	// Sem accepting/draining, um nó cheio e um nó drenando são indistinguíveis
 	// de "sem demanda" no gráfico de chamadas ativas.
-	out := New().Render(1000, &ShardGauges{ShardID: "a1", MaxCalls: 1000, Accepting: false, Draining: true})
+	out := New().Render(Gauges{ActiveCalls: 1000}, &ShardGauges{ShardID: "a1", MaxCalls: 1000, Accepting: false, Draining: true})
 	for _, esperado := range []string{
 		"ari_worker_max_calls 1000",
 		"ari_worker_accepting 0",
@@ -90,7 +90,7 @@ func TestRenderComShardDistingueSaturacaoDeDrenagem(t *testing.T) {
 func TestRenderEscapaORotulo(t *testing.T) {
 	// Um rótulo com aspas quebraria o parser e derrubaria a coleta do alvo
 	// inteiro, não só desta linha.
-	out := New().Render(0, &ShardGauges{ShardID: `a"1`})
+	out := New().Render(Gauges{}, &ShardGauges{ShardID: `a"1`})
 	if strings.Contains(out, `shard="a"1"`) {
 		t.Fatalf("rótulo não escapado: %s", out)
 	}

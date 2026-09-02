@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -58,9 +59,13 @@ type Options struct {
 	AppCheck     time.Duration
 	ReconnectMin time.Duration
 	ReconnectMax time.Duration
-	HTTPClient   *http.Client
-	Now          func() time.Time
-	Dialer       *websocket.Dialer // injetável para teste
+	// MaxConns é o TETO de conexões simultâneas com o Asterisk deste nó — não só
+	// o de ociosas. <= 0 usa DefaultMaxConns. Ignorado quando HTTPClient é
+	// injetado.
+	MaxConns   int
+	HTTPClient *http.Client
+	Now        func() time.Time
+	Dialer     *websocket.Dialer // injetável para teste
 }
 
 type Client struct {
@@ -76,18 +81,85 @@ type Client struct {
 	mu      sync.Mutex
 	appOkAt time.Time // última confirmação de que o app está registrado
 
-	hmu      sync.RWMutex
-	handlers map[string][]Handler
+	// hmu só serializa REGISTROS (que acontecem no boot). A leitura em `emit`
+	// é um load atômico do mapa inteiro: ver o comentário de On.
+	hmu      sync.Mutex
+	handlers atomic.Pointer[map[string][]Handler]
 
 	recMin, recMax time.Duration
 	dialer         *websocket.Dialer
+}
+
+// SESSÕES HTTP DO ASTERISK — o orçamento, e por que ele existe.
+//
+// O servidor HTTP embutido do Asterisk aceita um número FIXO de sessões
+// simultâneas (`sessionlimit` no http.conf) e RECUSA a conexão passando dele.
+// MEDIDO em 02/09/2026 contra a imagem do lab (Asterisk 20.20.1, andrius/
+// asterisk:20, o http.conf de lab/asterisk/): 100 conexões keep-alive aceitas,
+// a 101ª recusada. Nem o lab nem o render_config.py do worker-asterisk
+// definiam o valor — os 100 eram o default herdado sem ninguém saber.
+//
+// Por esse mesmo servidor passam três coisas de perfis muito diferentes: o
+// WebSocket de eventos (uma sessão, permanente), o controle de chamadas
+// (milissegundos por requisição) e o download das gravações (arquivos de MBs,
+// segundos por sessão). Estourar o teto NÃO degrada graciosamente: o originate
+// da chamada nova toma "connection refused" igual ao download, e uma chamada
+// que não monta por recusa de conexão é indistinguível de uma que não monta por
+// qualquer outro motivo — o mesmo modo de falha invisível do ulimit de file
+// descriptors documentado em lab/bench/RESULTADOS.md.
+//
+// Daí o orçamento explícito: o cliente REST nunca abre mais que MaxConns
+// conexões, e o orquestrador limita à parte quantas delas podem estar em
+// gravação (ver orchestrator.Options.RecordingConcurrency). O que sobra é
+// sempre para o controle de chamadas.
+const (
+	// DefaultSessionLimit é o teto do Asterisk que este worker assume. Tem que
+	// bater com o `sessionlimit` do http.conf do nó — se lá for menor, o teto
+	// que vale é o de lá, e o worker vai tomar recusa antes de chegar no seu.
+	DefaultSessionLimit = 100
+	// ReservaSessoes é o que NÃO é do cliente REST: o WebSocket de eventos (que
+	// disca por fora deste transporte) e folga para os outros que falam com o
+	// mesmo ARI — o front, um `curl` de diagnóstico, o cmd/probe.
+	ReservaSessoes = 8
+	// DefaultMaxConns é o teto do cliente REST. Ver NewTransport.
+	DefaultMaxConns = DefaultSessionLimit - ReservaSessoes
+)
+
+// NewTransport devolve um transporte dimensionado para UM host, com TETO.
+//
+// Duas coisas, e a segunda é a que importa:
+//
+//  1. MaxIdleConnsPerHost. O http.DefaultTransport guarda no máximo DUAS
+//     conexões ociosas por host, e TODO o controle REST deste worker vai para um
+//     host só — o Asterisk do próprio nó. Com goroutine por evento (ver
+//     cmd/worker/main.go), uma chamada de saída faz ~7 idas ao ARI e dezenas
+//     dessas sequências correm em paralelo: passando de duas ociosas, a conexão
+//     é FECHADA ao fim de cada resposta e a próxima paga handshake de novo,
+//     deixando o socket em TIME_WAIT.
+//
+//  2. MaxConnsPerHost. Sem ele o pool é ILIMITADO: o Go abre quantas conexões
+//     precisar, e é assim que o worker estoura o `sessionlimit` do Asterisk e
+//     passa a tomar recusa em vez de resposta. Com o teto, a requisição
+//     excedente ESPERA uma conexão livre — trocar "connection refused" por
+//     alguns milissegundos de espera é a diferença entre uma chamada que não
+//     monta e uma que monta um pouco mais devagar.
+func NewTransport(maxConns int) *http.Transport {
+	if maxConns <= 0 {
+		maxConns = DefaultMaxConns
+	}
+	t := http.DefaultTransport.(*http.Transport).Clone()
+	t.MaxConnsPerHost = maxConns
+	t.MaxIdleConns = maxConns
+	t.MaxIdleConnsPerHost = maxConns
+	t.IdleConnTimeout = 90 * time.Second
+	return t
 }
 
 func New(o Options) *Client {
 	base := strings.TrimRight(o.BaseURL, "/")
 	hc := o.HTTPClient
 	if hc == nil {
-		hc = &http.Client{Timeout: 15 * time.Second}
+		hc = &http.Client{Timeout: 15 * time.Second, Transport: NewTransport(o.MaxConns)}
 	}
 	now := o.Now
 	if now == nil {

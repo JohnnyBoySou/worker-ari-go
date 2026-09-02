@@ -47,6 +47,21 @@ type CallTiming struct {
 	StartedAt *time.Time
 }
 
+// ChannelCall é a resposta do fallback do ChannelDestroyed: quem é a chamada
+// dona de um canal E em que estado ela está.
+//
+// Os dois campos vêm juntos porque a pergunta é uma só. A versão anterior tinha
+// FindCallIDByChannel e GetCallTiming separadas e o handler chamava as duas em
+// sequência — dois round-trips no Postgres para CADA perna que cai fora do
+// índice em memória, que é o caso da maioria das chamadas de saída (o vendedor
+// não atende). O banco é compartilhado por todos os nós do ASG: metade das idas
+// some com uma consulta só.
+type ChannelCall struct {
+	CallID    string
+	Status    string
+	StartedAt *time.Time
+}
+
 // PendingRecording é uma chamada COMPLETED cuja gravação foi criada no Asterisk
 // mas nunca subiu ao S3 — alvo do backfill.
 type PendingRecording struct {
@@ -58,7 +73,7 @@ type PendingRecording struct {
 type Store interface {
 	CreateCall(ctx context.Context, c CreateCall) error
 	UpdateCall(ctx context.Context, callID string, p Patch) error
-	FindCallIDByChannel(ctx context.Context, channelID string) (string, error)
+	FindCallByChannel(ctx context.Context, channelID string) (*ChannelCall, error)
 	FindSellerByInboundDid(ctx context.Context, did string) (*InboundSeller, error)
 	GetCallTiming(ctx context.Context, callID string) (*CallTiming, error)
 	FindPendingRecordings(ctx context.Context, limit int) ([]PendingRecording, error)

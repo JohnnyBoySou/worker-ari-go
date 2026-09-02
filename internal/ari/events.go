@@ -17,19 +17,39 @@ type Handler func(tipo string, payload []byte)
 // On registra um handler por tipo de evento. Além dos eventos do ARI
 // (StasisStart, ChannelDestroyed), o client emite os sintéticos "open" e
 // "close", com payload vazio.
+//
+// COPY-ON-WRITE. Os registros acontecem no boot e param; o `emit` roda para
+// TODO evento do Asterisk — e a assinatura é `subscribeAll=true`, então chega
+// muito mais do que os dois tipos que este worker trata (ChannelVarset, DTMF,
+// eventos de bridge…). A leitura precisa ser o mais barata possível, e a versão
+// com RWMutex copiava o slice de handlers a cada evento: uma alocação por
+// evento, no caminho mais quente do processo, para um slice que nunca muda
+// depois do boot. Aqui o `emit` faz um load atômico e itera o mapa vivo — zero
+// alocação, zero lock — e o `On` publica um mapa NOVO.
 func (c *Client) On(tipo string, h Handler) {
 	c.hmu.Lock()
 	defer c.hmu.Unlock()
-	if c.handlers == nil {
-		c.handlers = map[string][]Handler{}
+	novo := map[string][]Handler{}
+	if atual := c.handlers.Load(); atual != nil {
+		for k, v := range *atual {
+			novo[k] = v
+		}
 	}
-	c.handlers[tipo] = append(c.handlers[tipo], h)
+	// append sobre uma CÓPIA do slice: um emit em curso pode estar iterando o
+	// slice antigo, e crescer o mesmo array por baixo dele seria corrida.
+	novo[tipo] = append(append([]Handler(nil), novo[tipo]...), h)
+	c.handlers.Store(&novo)
 }
 
 func (c *Client) emit(tipo string, payload []byte) {
-	c.hmu.RLock()
-	hs := append([]Handler(nil), c.handlers[tipo]...)
-	c.hmu.RUnlock()
+	m := c.handlers.Load()
+	if m == nil {
+		return
+	}
+	hs := (*m)[tipo]
+	if len(hs) == 0 {
+		return
+	}
 	for _, h := range hs {
 		func() {
 			// Handler de aplicação que entra em pânico NÃO pode derrubar o
@@ -113,6 +133,7 @@ func (c *Client) serve(ctx connCtx) {
 
 	c.markAppOk()
 	logx.Info("ari.ws_conectado", "app", c.app)
+
 	c.emit("open", nil)
 	defer c.emit("close", nil)
 

@@ -1,8 +1,12 @@
 package orchestrator
 
 import (
+	"context"
 	"errors"
+	"fmt"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/lai/worker-ari/internal/ari"
 	"github.com/lai/worker-ari/internal/metrics"
@@ -113,5 +117,87 @@ func TestBackfillSoRepublicaOQuePersistiu(t *testing.T) {
 	}
 	if res.Total != 1 || res.Uploaded != 1 || res.Skipped != 0 {
 		t.Fatalf("res = %+v", res)
+	}
+}
+
+// uploaderLento bloqueia dentro do Upload para o teste observar quantas
+// gravações estão em voo ao mesmo tempo.
+type uploaderLento struct {
+	mu       sync.Mutex
+	emVoo    int
+	pico     int
+	liberar  chan struct{}
+	chegadas chan struct{}
+	subidos  int
+}
+
+func (u *uploaderLento) BucketName() string { return "bucket-teste" }
+func (u *uploaderLento) Upload(context.Context, string, []byte, string) error {
+	u.mu.Lock()
+	u.emVoo++
+	if u.emVoo > u.pico {
+		u.pico = u.emVoo
+	}
+	u.mu.Unlock()
+	u.chegadas <- struct{}{}
+	<-u.liberar
+	u.mu.Lock()
+	u.emVoo--
+	u.subidos++
+	u.mu.Unlock()
+	return nil
+}
+
+func (u *uploaderLento) totalSubidos() int {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	return u.subidos
+}
+
+// O TETO. Sem ele, uma drenagem com centenas de chamadas ativas dispara uma
+// goroutine de upload por chamada: cada uma carrega o WAV inteiro em memória e
+// segura uma sessão HTTP do Asterisk no download — e o Asterisk aceita 100
+// sessões ao todo, medido. Passando disso, quem toma "connection refused" é
+// também o originate da chamada nova.
+func TestGravacoesConcorrentesRespeitamOTeto(t *testing.T) {
+	const teto, total = 3, 12
+	a, s := novoAri(), novoStore()
+	a.gravacao = []byte("RIFFfake")
+	u := &uploaderLento{liberar: make(chan struct{}), chegadas: make(chan struct{}, total)}
+	c := comUploader(a, s, u, Options{RecordingConcurrency: teto})
+
+	var wg sync.WaitGroup
+	for i := range total {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			_, _ = c.uploadRecording(ctx, fmt.Sprintf("call_%d", i), "org_1", "rec")
+		}(i)
+	}
+
+	// Espera o semáforo encher e confirma que ele NÃO deixa passar mais.
+	for range teto {
+		<-u.chegadas
+	}
+	if got := c.RecordingsInFlight(); got != teto {
+		t.Fatalf("em voo = %d, queria %d", got, teto)
+	}
+	select {
+	case <-u.chegadas:
+		t.Fatal("passou do teto")
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	close(u.liberar)
+	wg.Wait()
+
+	if u.pico > teto {
+		t.Fatalf("pico de uploads simultâneos = %d, teto = %d", u.pico, teto)
+	}
+	if n := u.totalSubidos(); n != total {
+		t.Fatalf("subiram %d de %d — o teto atrasa, não descarta", n, total)
+	}
+	if got := c.RecordingsInFlight(); got != 0 {
+		t.Fatalf("em voo depois de tudo = %d", got)
 	}
 }

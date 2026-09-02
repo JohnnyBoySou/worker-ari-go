@@ -16,8 +16,26 @@ import (
 // schema é canônico no back — este arquivo tem que acompanhar as migrações de lá.
 type Postgres struct{ pool *pgxpool.Pool }
 
-func NewPostgres(ctx context.Context, url string) (*Postgres, error) {
-	pool, err := pgxpool.New(ctx, url)
+// NewPostgres abre o pool.
+//
+// maxConns > 0 sobrescreve o default do pgx, que é max(4, NumCPU): num sidecar
+// de 2 vCPUs são QUATRO conexões para as ~4 escritas de cada chamada, e com
+// goroutine por evento (ver cmd/worker/main.go) um pico de finalizações vira
+// fila no pool antes de virar fila no banco. Um `pool_max_conns` explícito na
+// DATABASE_URL continua vencendo — quem escreveu a URL sabe do ambiente.
+func NewPostgres(ctx context.Context, url string, maxConns int) (*Postgres, error) {
+	cfg, err := pgxpool.ParseConfig(url)
+	if err != nil {
+		return nil, err
+	}
+	if maxConns > 0 && !strings.Contains(url, "pool_max_conns") {
+		cfg.MaxConns = int32(maxConns)
+		// Duas conexões quentes: abrir conexão no Postgres custa handshake +
+		// autenticação, e pagar isso no primeiro UPDATE de um pico é somar
+		// latência exatamente onde ela dói.
+		cfg.MinConns = 2
+	}
+	pool, err := pgxpool.NewWithConfig(ctx, cfg)
 	if err != nil {
 		return nil, err
 	}
@@ -88,15 +106,20 @@ func (p *Postgres) UpdateCall(ctx context.Context, callID string, patch Patch) e
 	return err
 }
 
-func (p *Postgres) FindCallIDByChannel(ctx context.Context, channelID string) (string, error) {
-	var id string
+// FindCallByChannel resolve a chamada dona de um canal — id e estado na MESMA
+// consulta. Ver o comentário de store.ChannelCall.
+func (p *Postgres) FindCallByChannel(ctx context.Context, channelID string) (*ChannelCall, error) {
+	var c ChannelCall
 	err := p.pool.QueryRow(ctx,
-		`SELECT id FROM "call" WHERE sip_channel_id = $1 ORDER BY created_at DESC LIMIT 1`,
-		channelID).Scan(&id)
+		`SELECT id, status, started_at FROM "call" WHERE sip_channel_id = $1 ORDER BY created_at DESC LIMIT 1`,
+		channelID).Scan(&c.CallID, &c.Status, &c.StartedAt)
 	if errors.Is(err, sql.ErrNoRows) || isNoRows(err) {
-		return "", nil
+		return nil, nil
 	}
-	return id, err
+	if err != nil {
+		return nil, err
+	}
+	return &c, nil
 }
 
 func (p *Postgres) FindSellerByInboundDid(ctx context.Context, did string) (*InboundSeller, error) {

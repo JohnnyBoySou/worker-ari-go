@@ -108,6 +108,37 @@ evitar isso é o produtor, escolhendo um shard com folga no registro. Vale recus
 porque a falha no teto não é graciosa — passar da capacidade de mídia degrada o
 áudio de **todas** as chamadas do nó.
 
+### Sessões HTTP do Asterisk
+
+O servidor HTTP embutido do Asterisk aceita um número **fixo** de sessões
+simultâneas (`sessionlimit` do `http.conf`) e **recusa a conexão** passando dele.
+Medido em 02/09/2026 no Asterisk 20.20.1: **100 aceitas, a 101ª recusada** — e o
+valor era o default herdado, não declarado em lugar nenhum.
+
+Por esse mesmo servidor passam o WebSocket de eventos (uma sessão, permanente),
+todo o controle de chamadas (milissegundos) e o **download das gravações**
+(arquivos de MBs, segundos por sessão). Estourar o teto não degrada: o
+`originate` da chamada nova toma recusa igual ao download, e uma chamada que não
+monta por conexão recusada é indistinguível de uma que não monta por qualquer
+outro motivo — o mesmo modo de falha invisível do `ulimit -n`.
+
+Por isso o orçamento é explícito e o worker **não abre mais conexões do que
+cabe**:
+
+```
+ARI_HTTP_SESSION_LIMIT (100)   o que o http.conf do nó aceita
+      − ari.ReservaSessoes (8)   WebSocket de eventos, front, probe, curl
+      = ARI_MAX_CONNS (92)       teto do cliente REST (MaxConnsPerHost)
+          dos quais RECORDING_CONCURRENCY (8) em gravação
+          → ~84 sempre livres para o controle de chamadas
+```
+
+`ARI_HTTP_SESSION_LIMIT` **tem que bater** com o `sessionlimit` que o
+`render_config.py` do `worker-asterisk` renderiza. Se lá for menor, o teto que
+vale é o de lá e o worker toma recusa antes de chegar no seu. O
+`ari_worker_recordings_inflight` contra o `ari_worker_recordings_max` no
+`/metrics` é o que mostra saturação do lado das gravações.
+
 ### Drenagem
 
 `SIGTERM` → marca `draining` → **sai do registro** (o produtor para de escolher

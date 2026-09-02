@@ -58,7 +58,13 @@ type state struct {
 	aiAgent map[string]string
 	// callId -> UUID do AudioSocket pré-escolhido pela API.
 	aiVoiceUUID map[string]string
+	// callId -> destino/DID do comando startOutbound. Ver outboundDe.
+	outbound map[string]outboundVars
 }
+
+// outboundVars é o que o handler do Stasis precisa saber sobre um outbound que
+// ESTE processo originou.
+type outboundVars struct{ target, did string }
 
 func newState() *state {
 	return &state{
@@ -67,6 +73,7 @@ func newState() *state {
 		channelIndex: map[string]string{},
 		aiAgent:      map[string]string{},
 		aiVoiceUUID:  map[string]string{},
+		outbound:     map[string]outboundVars{},
 	}
 }
 
@@ -99,16 +106,41 @@ func (s *state) hasOrg(callID string) bool {
 func (s *state) deleteOrg(callID string) {
 	s.mu.Lock()
 	delete(s.callOrg, callID)
+	delete(s.outbound, callID)
 	s.mu.Unlock()
 }
 
-// limparIA é o bloco final do finalize: org + agente + uuid pré-escolhido.
+// setOutbound guarda o destino e o DID que o comando startOutbound trouxe.
+func (s *state) setOutbound(callID, target, did string) {
+	s.mu.Lock()
+	s.outbound[callID] = outboundVars{target: target, did: did}
+	s.mu.Unlock()
+}
+
+// outboundDe devolve o que o startOutbound trouxe, se ESTE processo o originou.
+//
+// Existe para poupar DOIS round-trips REST no caminho crítico de cada chamada
+// de saída: o handler do Stasis lia OUTBOUND_TARGET e OUTBOUND_DID de volta do
+// Asterisk, valores que o próprio worker acabara de mandar no originate. O
+// segundo retorno é `false` quando o worker reiniciou entre o originate e o
+// atendimento — aí o Asterisk é quem lembra, e o chamador cai na variável de
+// canal.
+func (s *state) outboundDe(callID string) (string, string, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	v, ok := s.outbound[callID]
+	return v.target, v.did, ok
+}
+
+// limparIA é o bloco final do finalize: org + agente + uuid pré-escolhido (e o
+// destino do outbound, que tem o mesmo tempo de vida).
 // No TS são três deletes seguidos sem await, então aqui é uma seção crítica só.
 func (s *state) limparIA(callID string) {
 	s.mu.Lock()
 	delete(s.callOrg, callID)
 	delete(s.aiAgent, callID)
 	delete(s.aiVoiceUUID, callID)
+	delete(s.outbound, callID)
 	s.mu.Unlock()
 }
 

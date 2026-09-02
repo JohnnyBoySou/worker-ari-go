@@ -73,7 +73,8 @@ func (f *fakeAri) UnmuteChannel(_ context.Context, id, d string) error {
 	f.reg("unmute", id, d)
 	return nil
 }
-func (f *fakeAri) GetChannelVar(_ context.Context, _, name string) string {
+func (f *fakeAri) GetChannelVar(_ context.Context, id, name string) string {
+	f.reg("getvar", id, name)
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.vars[name]
@@ -141,10 +142,18 @@ func (s *fakeStore) UpdateCall(_ context.Context, id string, p store.Patch) erro
 	s.mu.Unlock()
 	return s.erroUpd
 }
-func (s *fakeStore) FindCallIDByChannel(_ context.Context, ch string) (string, error) {
+func (s *fakeStore) FindCallByChannel(_ context.Context, ch string) (*store.ChannelCall, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.porCanal[ch], nil
+	id := s.porCanal[ch]
+	if id == "" {
+		return nil, nil
+	}
+	c := &store.ChannelCall{CallID: id}
+	if t := s.timing[id]; t != nil {
+		c.Status, c.StartedAt = t.Status, t.StartedAt
+	}
+	return c, nil
 }
 func (s *fakeStore) FindSellerByInboundDid(context.Context, string) (*store.InboundSeller, error) {
 	return s.seller, nil
