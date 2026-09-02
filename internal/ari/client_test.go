@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -34,6 +35,27 @@ type fakeAsterisk struct {
 
 	mu    sync.Mutex
 	conns []*websocket.Conn
+	// filtros = cada corpo de PUT /eventFilter recebido, na ordem. Uma LISTA e
+	// nao um valor: o filtro tem que ser reenviado a cada reconexao, e so
+	// guardando o historico o teste consegue provar isso.
+	filtros [][]string
+	// filtroErro = fazer o PUT falhar, para provar que a conexao sobrevive.
+	filtroErro atomic.Bool
+}
+
+func (f *fakeAsterisk) filtrosRecebidos() [][]string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([][]string(nil), f.filtros...)
+}
+
+func (f *fakeAsterisk) derrubarConexoes() {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, c := range f.conns {
+		_ = c.Close()
+	}
+	f.conns = nil
 }
 
 func novoFakeAsterisk(t *testing.T) *fakeAsterisk {
@@ -64,6 +86,27 @@ func novoFakeAsterisk(t *testing.T) *fakeAsterisk {
 		}()
 	})
 	mux.HandleFunc("/ari/applications/", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPut && strings.HasSuffix(r.URL.Path, "/eventFilter") {
+			if f.filtroErro.Load() {
+				w.WriteHeader(http.StatusInternalServerError)
+				return
+			}
+			var corpo struct {
+				Allowed []struct {
+					Type string `json:"type"`
+				} `json:"allowed"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&corpo)
+			tipos := make([]string, 0, len(corpo.Allowed))
+			for _, a := range corpo.Allowed {
+				tipos = append(tipos, a.Type)
+			}
+			f.mu.Lock()
+			f.filtros = append(f.filtros, tipos)
+			f.mu.Unlock()
+			_, _ = w.Write([]byte(`{"name":"connect"}`))
+			return
+		}
 		f.appChecks.Add(1)
 		if !f.appRegistrado.Load() {
 			w.WriteHeader(http.StatusNotFound)
@@ -290,5 +333,96 @@ func TestHTTPErrorEIsStatus(t *testing.T) {
 	}
 	if !strings.HasPrefix(c.App(), "connect") {
 		t.Fatal("App() devia devolver o nome do app")
+	}
+}
+
+// --- filtro de eventos -------------------------------------------------------
+//
+// O que estes testes guardam e o achado de 02/09/2026 (issue #2): sem filtro, o
+// Asterisk serializa TODO evento do sistema no taskprocessor do app — 79.228
+// eventos para 600 chamadas, das quais o worker usa 4 cada — e a fila chegou a
+// 4.455 contra a marca d'agua de 500 do proprio Asterisk. O joelho de capacidade
+// era essa fila, nao CPU.
+
+func TestFiltroDeEventosDeclaraSoOQueTemHandler(t *testing.T) {
+	f := novoFakeAsterisk(t)
+	c := clienteDe(f, 0)
+	// Ordem de registro embaralhada de proposito: o filtro tem que sair
+	// ordenado, senao o corpo enviado muda a cada boot sem nada mudar de fato.
+	c.On("StasisStart", func(string, []byte) {})
+	c.On("open", func(string, []byte) {})
+	c.On("ChannelDestroyed", func(string, []byte) {})
+	c.On("close", func(string, []byte) {})
+
+	ctx, cancelar := context.WithCancel(context.Background())
+	defer cancelar()
+	go c.Run(ctx)
+
+	esperar(t, func() bool { return len(f.filtrosRecebidos()) > 0 }, "filtro enviado ao conectar")
+
+	got := f.filtrosRecebidos()[0]
+	want := []string{"ChannelDestroyed", "StasisStart"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("filtro enviado = %v, queria %v", got, want)
+	}
+	// "open" e "close" sao emitidos pelo PROPRIO cliente. Mandados no filtro, o
+	// Asterisk nao os reconhece e a lista inteira vira recusa.
+	for _, tipo := range got {
+		if tipo == "open" || tipo == "close" {
+			t.Fatalf("evento sintetico %q vazou para o filtro", tipo)
+		}
+	}
+}
+
+func TestFiltroDeEventosEReenviadoACadaReconexao(t *testing.T) {
+	f := novoFakeAsterisk(t)
+	c := clienteDe(f, 0)
+	c.On("StasisStart", func(string, []byte) {})
+
+	ctx, cancelar := context.WithCancel(context.Background())
+	defer cancelar()
+	go c.Run(ctx)
+
+	esperar(t, func() bool { return len(f.filtrosRecebidos()) >= 1 }, "primeiro filtro")
+
+	// O filtro vive no REGISTRO do app, e o app se registra ao abrir o socket:
+	// caiu o socket, o filtro foi junto. Sem reenviar, a reconexao volta a
+	// receber o sistema inteiro — e nada no worker acusaria.
+	f.derrubarConexoes()
+
+	esperar(t, func() bool { return len(f.filtrosRecebidos()) >= 2 }, "filtro reenviado apos reconectar")
+
+	if got := f.filtrosRecebidos()[1]; !reflect.DeepEqual(got, []string{"StasisStart"}) {
+		t.Fatalf("filtro da reconexao = %v, queria [StasisStart]", got)
+	}
+}
+
+func TestFalhaAoFiltrarNaoDerrubaAConexao(t *testing.T) {
+	f := novoFakeAsterisk(t)
+	f.filtroErro.Store(true)
+	c := clienteDe(f, 0)
+
+	recebidos := make(chan string, 1)
+	c.On("StasisStart", func(tipo string, _ []byte) {
+		select {
+		case recebidos <- tipo:
+		default:
+		}
+	})
+
+	ctx, cancelar := context.WithCancel(context.Background())
+	defer cancelar()
+	go c.Run(ctx)
+
+	esperar(t, func() bool { return f.vivas.Load() == 1 }, "socket conectado")
+	f.enviarEvento(t, map[string]any{"type": "StasisStart"})
+
+	// Um Asterisk anterior ao 18 nao tem o endpoint: o PUT falha e ele continua
+	// entregando tudo. Isso e o comportamento ANTIGO — mais lento, nao incorreto.
+	// Derrubar a conexao por causa dele trocaria lentidao por indisponibilidade.
+	select {
+	case <-recebidos:
+	case <-time.After(3 * time.Second):
+		t.Fatal("evento nao chegou: a falha no filtro derrubou a conexao")
 	}
 }

@@ -402,3 +402,29 @@ func (c *Client) CheckApp(ctx context.Context) (registrado bool, conclusivo bool
 	logx.Warn("ari.app_check_inconclusivo", "err", err.Error())
 	return false, false
 }
+
+// SetEventFilter declara ao Asterisk QUAIS tipos de evento este app quer
+// receber. Sem isso o Asterisk entrega o sistema inteiro.
+//
+// O CUSTO DE NÃO FILTRAR NÃO É DE REDE, É DE FILA. Todo evento do app passa por
+// UM taskprocessor (`stasis/m:ari:application/<app>`), que é uma fila com um
+// consumidor só. Para cada mensagem dela o Asterisk monta o JSON do evento e
+// escreve no WebSocket — trabalho caro, feito em série. Medido no lab a 600
+// simultâneas: 79.228 eventos, dos quais o worker usa 4 por chamada, e a fila
+// chegou a 4.455 mensagens contra a marca d'água de 500 do próprio Asterisk.
+// Com o filtro dos dois tipos que importam, a MESMA carga fez a fila parar em
+// 178. O que muda não é quantas mensagens entram, é o quanto custa descartar
+// cada uma: filtrada, ela sai da fila sem virar JSON nem ir ao socket.
+//
+// `allowed` VAZIO no Asterisk significa "permite tudo", não "permite nada" —
+// por isso quem chama tem que garantir a lista não-vazia (ver tiposAssinados).
+func (c *Client) SetEventFilter(ctx context.Context, tipos []string) error {
+	allowed := make([]map[string]string, 0, len(tipos))
+	for _, t := range tipos {
+		allowed = append(allowed, map[string]string{"type": t})
+	}
+	_, err := c.req(ctx, http.MethodPut,
+		"/applications/"+url.PathEscape(c.app)+"/eventFilter", nil,
+		map[string]any{"allowed": allowed})
+	return err
+}

@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/url"
+	"sort"
+	"strings"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -18,10 +20,14 @@ type Handler func(tipo string, payload []byte)
 // (StasisStart, ChannelDestroyed), o client emite os sintéticos "open" e
 // "close", com payload vazio.
 //
+// O QUE SE REGISTRA AQUI VIRA O FILTRO DE EVENTOS DO APP. Ao conectar, `serve`
+// lê este mapa e declara ao Asterisk exatamente estes tipos (ver
+// tiposAssinados e Client.SetEventFilter). Registrar um `On` novo depois do
+// boot NÃO reabre o filtro — o Asterisk continuaria descartando o tipo antes de
+// mandar, e o handler nunca rodaria. Registre tudo antes de `Run`.
+//
 // COPY-ON-WRITE. Os registros acontecem no boot e param; o `emit` roda para
-// TODO evento do Asterisk — e a assinatura é `subscribeAll=true`, então chega
-// muito mais do que os dois tipos que este worker trata (ChannelVarset, DTMF,
-// eventos de bridge…). A leitura precisa ser o mais barata possível, e a versão
+// todo evento que o filtro deixa passar. A leitura precisa ser barata, e a versão
 // com RWMutex copiava o slice de handlers a cada evento: uma alocação por
 // evento, no caminho mais quente do processo, para um slice que nunca muda
 // depois do boot. Aqui o `emit` faz um load atômico e itera o mapa vivo — zero
@@ -63,6 +69,28 @@ func (c *Client) emit(tipo string, payload []byte) {
 			h(tipo, payload)
 		}()
 	}
+}
+
+// eventosSinteticos são os tipos que o PRÓPRIO client emite, não o Asterisk.
+// Mandá-los no filtro faria o Asterisk recusar a lista inteira.
+var eventosSinteticos = map[string]bool{"open": true, "close": true}
+
+// tiposAssinados são os eventos do Asterisk que têm handler registrado — a
+// lista que vira o filtro. Ordenada para o filtro enviado ser determinístico.
+func (c *Client) tiposAssinados() []string {
+	m := c.handlers.Load()
+	if m == nil {
+		return nil
+	}
+	out := make([]string, 0, len(*m))
+	for tipo, hs := range *m {
+		if len(hs) == 0 || eventosSinteticos[tipo] {
+			continue
+		}
+		out = append(out, tipo)
+	}
+	sort.Strings(out)
+	return out
 }
 
 // Run mantém o WebSocket de eventos vivo até o contexto ser cancelado.
@@ -133,6 +161,19 @@ func (c *Client) serve(ctx connCtx) {
 
 	c.markAppOk()
 	logx.Info("ari.ws_conectado", "app", c.app)
+
+	// O filtro é POR REGISTRO do app, e o app se registra ao abrir ESTE socket:
+	// toda reconexão precisa declará-lo de novo, senão a mangueira volta a
+	// aberta sem nada avisar. Falhar aqui não derruba a conexão — um Asterisk
+	// sem o endpoint (anterior ao 18) continua entregando tudo, que é o
+	// comportamento antigo: mais lento, não incorreto.
+	if tipos := c.tiposAssinados(); len(tipos) > 0 {
+		if err := c.SetEventFilter(connCtxV, tipos); err != nil {
+			logx.Warn("ari.event_filter_falhou", "tipos", strings.Join(tipos, ","), "err", err.Error())
+		} else {
+			logx.Info("ari.event_filter", "tipos", strings.Join(tipos, ","))
+		}
+	}
 
 	c.emit("open", nil)
 	defer c.emit("close", nil)
