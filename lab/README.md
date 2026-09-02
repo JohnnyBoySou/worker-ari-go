@@ -62,6 +62,7 @@ inbound não chega numa máquina nova sem ação do provedor.
 ## Rodar
 
 ```bash
+python3 bench/mkpcap.py        # gera os pcaps de RTP; ver "Mídia" abaixo
 docker compose up -d
 set -a && . ./.env.lab && set +a
 
@@ -71,6 +72,40 @@ set -a && . ./.env.lab && set +a
 curl -X POST localhost:8092/v1/calls -H 'content-type: application/json' \
   -d '{"organizationId":"org_lab","targetPhone":"5541988887777","sellerSipUsername":"1001"}'
 ```
+
+## Mídia
+
+As pontas SIPp não só atendem: elas **tocam RTP em laço** enquanto a chamada
+durar. Duas coisas dependem disso.
+
+**Os pcaps são gerados, não versionados.** `python3 bench/mkpcap.py` escreve
+`bench/media/alaw-10s.pcap` e `bench/media/g722-10s.pcap`. Gerar em vez de usar
+o `g711a.pcap` da imagem do SIPp resolve um problema concreto: o
+`play_pcap_audio` toca **uma vez**, e com um arquivo de duração desconhecida o
+áudio simplesmente para no meio de um teste que segura a chamada por 15s — sem
+erro e sem sintoma, medindo uma carga que não é a que se quis medir. Com duração
+conhecida (10s), o `ontimeout` do cenário rearma o play a cada 10,3s.
+
+O pcap de A-law tem **áudio de verdade** (uma senoide de 440 Hz codificada em
+G.711), então a gravação que sobe para o S3 é audível — o teste mais barato de
+"gravou som" contra "gravou silêncio".
+
+> **O SIPp carrega o pcap ao parsear o cenário**, não na hora de tocar. Sem os
+> arquivos, os três containers `uas-*` sobem quebrados. Gere antes do `up`.
+
+**O modo transcoding.** Com `1001` e `1002` os dois lados falam G.711 e o
+Asterisk fica em passthrough: o cenário barato. O endpoint `1003` fala **só
+G.722**, e discá-lo põe o Asterisk para decodificar ADPCM de 16 kHz, reamostrar
+e recodificar em cada sentido:
+
+```bash
+MODO=transcode ./bench/bench.sh 300 40 15
+```
+
+Não exige reconfigurar o worker: a perna A é `PJSIP/<sellerSipUsername>`, então
+o modo é só um campo diferente no corpo do POST. O áudio do pcap de G.722 é
+ruído sintético de propósito (não há codificador de G.722 aqui) — mede CPU de
+transcoding, não qualidade.
 
 ## Detalhes que importam
 

@@ -227,18 +227,34 @@ for id in $ids; do
   nativo=$(var_canal "$id" 'CHANNEL(audionativeformat)')
   leitura=$(var_canal "$id" 'CHANNEL(audioreadformat)')
   qos=$(var_canal "$id" 'CHANNEL(rtpqos,audio,all)')
-  [ -n "$qos" ] && echo "${nativo:-?}|${leitura:-?}|$qos" >> "$TMP/midia"
+  # Separador TAB, nao `|`: o proprio nome do formato nativo pode trazer `|`
+  # quando o canal tem varios ("(alaw|ulaw)"), e ai o parser comeria os campos.
+  [ -n "$qos" ] && printf '%s\t%s\t%s\n' "${nativo:-?}" "${leitura:-?}" "$qos" >> "$TMP/midia"
 done
 
 if [ ! -s "$TMP/midia" ]; then
   echo "  nenhuma perna respondeu (chamadas ja caidas?)"
 else
   echo "  amostra crua de uma perna: $(head -1 "$TMP/midia")"
-  awk -F'|' '
+  # O formato nativo vem entre parenteses e pode listar varios separados por
+  # `|` ("(alaw|ulaw)"); o de leitura vem cru ("alaw"). Comparar as duas strings
+  # direto acusaria transcoding em 100% das pernas, sempre. A pergunta certa e
+  # se o formato de LEITURA esta ENTRE os nativos: se nao esta, houve traducao.
+  awk -F'\t' '
+    function tem_traducao(nativos, leitura,   crus, k, n) {
+      gsub(/[()]/, "", nativos)
+      n = split(nativos, crus, /[|,\/]+/)
+      for (k = 1; k <= n; k++) if (crus[k] == leitura) return 0
+      return 1
+    }
     { split($3, kv, ";"); for (i in kv) { split(kv[i], p, "="); v[p[1]] = p[2] }
       lp += v["lp"]; rx += v["rxcount"]; rlp += v["rlp"]
       j[++n] = v["rxjitter"] + 0
-      if ($1 != $2) trans++
+      if ($1 != "?" && $2 != "?") {
+        conhecidas++
+        par[$1 " -> " $2]++
+        if (tem_traducao($1, $2)) trans++
+      }
       delete v }
     END {
       if (!n) exit
@@ -248,7 +264,8 @@ else
              lp, rx, (rx ? 100*lp/(lp+rx) : 0), rlp
       printf "  jitter RX (s, como o Asterisk reporta): p50=%.6f p95=%.6f max=%.6f\n", \
              j[int(n*0.5)+1], j[int(n*0.95)+1], j[n]
-      printf "  transcoding: %d de %d pernas com formato de leitura != nativo\n", trans, n
+      printf "  transcoding: %d de %d pernas com formato de leitura fora dos nativos\n", trans, conhecidas
+      for (k in par) printf "    %-28s %d pernas\n", k, par[k]
     }' "$TMP/midia"
 fi
 echo "  bridges por tecnologia:$(asterisk_cli 'bridge show all' | grep -oE 'softmix|simple_bridge|native_rtp|holding_bridge' | sort | uniq -c | awk '{printf " %sx%s", $1, $2}')"
