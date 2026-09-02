@@ -8,13 +8,22 @@ Sobe a stack inteira em Docker e roda o **fluxo completo de uma chamada** sem
 operadora, sem softphone humano e sem custo.
 
 ```
-mini-back (Go)  ──NATS ari.cmd.lab──▶  worker-ari-go  ──ARI──▶  Asterisk 20
-     │                                                              │  │
-     └──▶ Postgres (linha `call`)                          PJSIP/1001  PJSIP/…@trunk
-                                                                │         │
-                                                            SIPp uas   SIPp uas
-                                                            (atende)   (atende)
+mini-back (Go)  ──NATS ari.cmd.lab──▶  worker-ari-go  ──ARI──▶  Asterisk 20 :5080
+     │                                                            │    │    │
+     └──▶ Postgres (linha `call`)                        PJSIP/1001  …@trunk  PJSIP/2001
+                                                              │        │        │
+                                                          SIPp uas  SIPp uas    ▼
+                                                          (atende)  (atende)  Kamailio :5062
+                                                                                 │ lookup(location)
+                                                                                 ▼
+                                                                        telefone registrado
+                                                                        (RTP pelo rtpengine)
 ```
+
+Dois caminhos, de propósito. **1001/1002/1003** têm contato estático e existem
+para o benchmark: não registram, não passam pelo proxy, e continuam medindo o
+mesmo que sempre mediram. **2001** registra no Kamailio de verdade, e é o
+caminho que exercita o location service.
 
 ## O que ele exercita
 
@@ -113,6 +122,71 @@ Não exige reconfigurar o worker: a perna A é `PJSIP/<sellerSipUsername>`, ent�
 o modo é só um campo diferente no corpo do POST. O áudio do pcap de G.722 é
 ruído sintético de propósito (não há codificador de G.722 aqui) — mede CPU de
 transcoding, não qualidade.
+
+## Kamailio: registrar e location service
+
+O `worker-asterisk` põe `ps_contacts` no Postgres compartilhado, então **todo
+nó lê o contato de um telefone que registrou em outro nó** — e manda INVITE
+para um caminho de volta que só aquele nó tem, porque o furo de NAT pertence a
+quem recebeu o REGISTER. É o problema que um proxy resolve, e ele precisa
+existir **antes do segundo nó**: com ~190 telefones já apontados direto para o
+Asterisk, pôr um proxy na frente depois significa reapontar todos.
+
+**Duas portas, e a direção sai da porta.** `5060` é a borda (telefones, único
+lugar que aceita REGISTER); `5062` é o lado interno (Asterisk). Decidir a
+direção pela porta em vez do IP de origem evita resolver o nome do Asterisk no
+parse da config e reiniciar o Kamailio a cada troca de IP. Em produção é a mesma
+topologia no mesmo host: Kamailio público em `:5060`, Asterisk atrás em `:5080`,
+interno em `127.0.0.1:5062`.
+
+**A localização vive no Postgres, não em memória** (`db_mode=3`, DB_ONLY). É o
+ponto do exercício: a tabela `location` é a fonte da verdade, então outro nó lê
+a mesma coisa sem replicação e sem cache para ficar velho. Custa uma ida ao
+banco por lookup.
+
+**O Path não funciona aqui — medido, não suposto.** O plano era gravar um Path
+próprio em cada REGISTER, para o location dizer por qual proxy se chega naquele
+contato. Implementado com `add_path_received()` e medido:
+
+```
+REGISTER 2001: supported=[path] path=[<null>]
+```
+
+`add_path_received()` insere o Path na cópia que vai ser **relayada**. Quando o
+próprio Kamailio é o registrar não há relay, e o `save()` lê os headers da
+mensagem recebida — onde o Path que acabamos de inserir não está. A função serve
+a um proxy de *borda* que encaminha o REGISTER para um registrar separado.
+
+A consequência vale mais que a linha de config: **um Kamailio por nó, cada um
+sendo seu próprio registrar sobre a mesma tabela, não resolve o problema** — o
+nó B enxerga o contato e não sabe que precisa passar pelo A. A topologia que
+funciona é **um Kamailio na borda para N Asterisks**, que é a que este lab monta.
+Se um dia cada nó ganhar o seu, o desenho tem de virar borda + registrar central.
+
+**A mídia passa pelo rtpengine**, ancorada no proxy. Isso põe um **segundo teto
+de capacidade** no caminho, e ele não tem número: o teto do Asterisk está medido
+na issue #1, o do rtpengine não foi medido por ninguém.
+
+### Provar que funciona
+
+```bash
+docker compose up -d
+docker exec lab-postgres psql -U lab -d lab -c 'select username, contact, received from location'
+```
+
+E uma chamada pelo caminho novo — o worker não muda, só o ramal discado:
+
+```bash
+curl -X POST localhost:8092/v1/calls -H 'content-type: application/json' \
+  -d '{"organizationId":"org_lab","targetPhone":"5541988887777","sellerSipUsername":"2001"}'
+
+docker exec lab-fone-2001 asterisk -rx 'core show channels concise'   # PJSIP/fone ... Up ... Echo
+docker logs lab-rtpengine | grep 'Confirmed peer address'             # os dois lados da mídia
+```
+
+> O esquema do Kamailio (`db/02-kamailio.sql`) só roda na **primeira**
+> inicialização do volume do Postgres. Num banco que já existe:
+> `docker exec -i lab-postgres psql -U lab -d lab < db/02-kamailio.sql`
 
 ## Detalhes que importam
 

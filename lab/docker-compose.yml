@@ -46,7 +46,8 @@ services:
         hard: 65536
     ports:
       - "8088:8088"          # ARI (o worker roda fora do compose)
-      - "5060:5060/udp"
+      # O SIP do Asterisk NAO e publicado: quem atende em :5060 agora e o
+      # Kamailio. O Asterisk escuta em :5080 e so o Kamailio fala com ele.
       # RTP NAO e publicado: ele flui entre Asterisk e SIPp dentro da rede `lab`.
       # Publicar a faixa inteira levaria minutos e nao muda nada — o worker fala
       # ARI (8088), nunca midia.
@@ -84,6 +85,67 @@ services:
     container_name: lab-uas-1003
     command: ["-sf", "/bench/uas-media-g722.xml", "-p", "5063", "-nostdin"]
     volumes: ["./bench:/bench:ro"]
+    networks: [lab]
+
+  # ---------------------------------------------------------------------------
+  # Kamailio: registrar e location service na frente do Asterisk.
+  #
+  # Duas portas de proposito: 5060 e a BORDA (telefones, unico lugar que aceita
+  # REGISTER) e 5062 e o lado INTERNO (Asterisk). A direcao da chamada sai da
+  # porta em que ela chegou, nao do IP de origem -- que exigiria resolver o nome
+  # do Asterisk no parse da config e reiniciar o Kamailio a cada troca de IP do
+  # container.
+  #
+  # Em producao esta e a mesma topologia, no mesmo host: Kamailio publico em
+  # :5060, Asterisk atras em :5080, e o lado interno em 127.0.0.1:5062.
+  kamailio:
+    build: ./kamailio
+    image: lab-kamailio:5.8
+    container_name: lab-kamailio
+    volumes:
+      - ./kamailio/kamailio.cfg:/etc/kamailio/kamailio.cfg:ro
+    ports:
+      - "5060:5060/udp"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks: [lab]
+
+  # rtpengine: ancora a midia entre telefone e Asterisk.
+  #
+  # A imagem detecta o IP do container no entrypoint e o escreve na config, e a
+  # faixa de RTP (23000-32768) NAO e publicada -- a midia flui dentro da rede
+  # `lab`, do mesmo jeito que a do Asterisk.
+  #
+  # AVISO QUE VALE REGISTRAR: ancorar midia poe um SEGUNDO teto de capacidade no
+  # caminho, e ele nao foi medido. O teto do Asterisk esta na issue #1; o do
+  # rtpengine nao tem numero nenhum ainda.
+  rtpengine:
+    image: drachtio/rtpengine:latest
+    container_name: lab-rtpengine
+    networks: [lab]
+
+  # O "telefone": um Asterisk pequeno que REGISTRA de verdade no Kamailio.
+  #
+  # Os ramais 1001/1002/1003 tem contato estatico e nunca registram, entao nunca
+  # exercitam o location service. Sem uma ponta que mande REGISTER, a tabela
+  # `location` fica vazia e o caminho novo nao e testado por ninguem.
+  fone-2001:
+    image: andrius/asterisk:20
+    container_name: lab-fone-2001
+    command:
+      - /bin/sh
+      - -c
+      - |
+        mkdir -p /var/log/asterisk/cdr-csv
+        chown -R asterisk:asterisk /var/log/asterisk
+        exec asterisk -f -vvv
+    volumes:
+      - ./fone/asterisk.conf:/etc/asterisk/asterisk.conf:ro
+      - ./fone/modules.conf:/etc/asterisk/modules.conf:ro
+      - ./fone/pjsip.conf:/etc/asterisk/pjsip.conf:ro
+      - ./fone/extensions.conf:/etc/asterisk/extensions.conf:ro
+    depends_on: [kamailio]
     networks: [lab]
 
   postgres:
